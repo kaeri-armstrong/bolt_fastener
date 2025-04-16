@@ -1,0 +1,36 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/arm/ros2ws/install/tcp_tunnel/local/lib/python3.10/dist-packages",
+        "/home/arm/ros2ws/install/hunter_msgs/local/lib/python3.10/dist-packages",
+        "/home/arm/ros2ws/build/frontass_rqt/src",
+        "/home/arm/ros2ws/install/frontass_rqt/lib/python3.10/site-packages",
+        "/home/arm/ros2ws/build/bolt_fastener",
+        "/home/arm/ros2ws/install/bolt_fastener/lib/python3.10/site-packages",
+        "/home/arm/ros2ws/build/bolt_fasten",
+        "/home/arm/ros2ws/install/bolt_fasten/lib/python3.10/site-packages",
+        "/home/arm/ros2ws/install/ass_msgs/local/lib/python3.10/dist-packages",
+        "/home/arm/ros2ws/build/armstrong_py",
+        "/home/arm/ros2ws/install/armstrong_py/lib/python3.10/site-packages",
+        "/home/arm/ros2ws/build/armstrong_m3a1_description",
+        "/home/arm/ros2ws/install/armstrong_m3a1_description/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/arm/ros2ws/install/tcp_tunnel/local/lib/python3.10/dist-packages",
+        "/home/arm/ros2ws/install/hunter_msgs/local/lib/python3.10/dist-packages",
+        "/home/arm/ros2ws/build/frontass_rqt/src",
+        "/home/arm/ros2ws/install/frontass_rqt/lib/python3.10/site-packages",
+        "/home/arm/ros2ws/build/bolt_fastener",
+        "/home/arm/ros2ws/install/bolt_fastener/lib/python3.10/site-packages",
+        "/home/arm/ros2ws/build/bolt_fasten",
+        "/home/arm/ros2ws/install/bolt_fasten/lib/python3.10/site-packages",
+        "/home/arm/ros2ws/install/ass_msgs/local/lib/python3.10/dist-packages",
+        "/home/arm/ros2ws/build/armstrong_py",
+        "/home/arm/ros2ws/install/armstrong_py/lib/python3.10/site-packages",
+        "/home/arm/ros2ws/build/armstrong_m3a1_description",
+        "/home/arm/ros2ws/install/armstrong_m3a1_description/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}

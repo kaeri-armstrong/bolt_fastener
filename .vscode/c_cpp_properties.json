@@ -1,0 +1,29 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/arm/ros2ws/install/tcp_tunnel/include/**",
+        "/home/arm/ros2ws/install/kdl_parser/include/**",
+        "/home/arm/ros2ws/install/hunter_msgs/include/**",
+        "/home/arm/ros2ws/install/ass_msgs/include/**",
+        "/home/arm/ros2ws/install/armstrong_m4_controller/include/**",
+        "/opt/ros/humble/include/**",
+        "/home/arm/ros2ws/src/armstrong_m4_controller/include/**",
+        "/home/arm/ros2ws/src/hunter_ros2/hunter_base/include/**",
+        "/home/arm/ros2ws/src/kdl_parser/kdl_parser/include/**",
+        "/home/arm/ros2ws/src/ros2_tcp_tunnel/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}
