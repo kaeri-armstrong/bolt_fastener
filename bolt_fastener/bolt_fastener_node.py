@@ -37,7 +37,8 @@ class BoltFastenerNode(Node):
         tcp_tunnel_prefix = '/tcp_tunnel_client' if use_tcp_tunnel else ''
         camera_namespace = '/camera/camera'
 
-        self.target = []
+        self.target = None
+        self.target_pose = None
         self.depth_intrinsics = {}
         self.confidence_threshold = 0.
         self.detection: DetectionResult | None = None
@@ -131,11 +132,17 @@ class BoltFastenerNode(Node):
         
         self.draw_timer = self.create_timer(1/30, self.on_draw_timer)
         self.prev_time = self.get_clock().now()
-        self.frame_count = 0
+        self.frame_time = []
         self.fps = 0
-        self.frame_time = 0.0
         self.rolling_avg_fps = 0.0
         self.alpha = 0.1  # Smoothing factor for rolling average
+        self.planning_status_map = {
+            ARMstrongPlanStatus.IDLE: "IDLE",
+            ARMstrongPlanStatus.PLANNING: "PLANNING",
+            ARMstrongPlanStatus.EXECUTING: "EXECUTING",
+            ARMstrongPlanStatus.COMPLETED: "COMPLETED",
+            ARMstrongPlanStatus.FAILED: "FAILED"
+        }
     
     def on_image_update(self, msg: CompressedImage):
         contrast = cv2.getTrackbarPos('Contrast', 'rgb')
@@ -163,6 +170,7 @@ class BoltFastenerNode(Node):
         if (self.detection is not None 
             and self.depth_intrinsics != {} 
             and self.depth is not None
+            and self.is_update_detection
             ):
             res = self.processor.estimate_bolt_pose_pipeline(
                 depth=self.depth,
@@ -174,8 +182,8 @@ class BoltFastenerNode(Node):
             if res is None:
                 return
             self.bolts, self.bolts_detection_info = res
-            for b in self.bolts:
-                self.publish_transform(b, 'camera_color_optical_frame')
+        for b in self.bolts:
+            self.publish_transform(b, 'camera_color_optical_frame')
 
     def on_depth_info_update(self, info: CameraInfo):
         depth_intrinsics = {'fx': info.k[0], 'fy': info.k[4], 'cx': info.k[2], 'cy': info.k[5], 'width': info.width, 'height': info.height, 'mtx': np.array(info.k).reshape(3, 3), 'dist': np.array(info.d)}
@@ -203,8 +211,9 @@ class BoltFastenerNode(Node):
                             if self.bolts_detection_info.group_id is not None 
                             else None
                         )
-                    target_pose = self.get_target_pose(target, tgt_offset=[-0.30, 0, 0.02])
-                    self.follow_target(target_pose)
+                    self.target_pose = self.get_target_pose(target, tgt_offset=[-0.30, 0, 0.02])
+                    if self.target_pose is not None:
+                        self.follow_target(self.target_pose)
                     return
 
     def on_draw_timer(self):
@@ -212,17 +221,18 @@ class BoltFastenerNode(Node):
         if rgb is None:
             return
             
-        # Calculate frame time and FPS
         current_time = self.get_clock().now()
-        frame_time = (current_time - self.prev_time).nanoseconds / 1e9
-        self.frame_time = frame_time
+        if self.prev_time is None:
+            self.prev_time = current_time
+        self.frame_time.append((current_time - self.prev_time).nanoseconds)
+        if len(self.frame_time) > 100:
+            self.frame_time.pop(0)
+        self.fps = 1 / np.mean(self.frame_time) * 1e9
         self.prev_time = current_time
         
-        self.frame_count += 1
-        if (current_time - self.prev_time).nanoseconds > 1e9:  # Update FPS every second
-            self.fps = self.frame_count
-            self.frame_count = 0
-            self.rolling_avg_fps = self.alpha * self.fps + (1 - self.alpha) * self.rolling_avg_fps
+        # Update target pose if target is set
+        if self.target is not None:
+            self.target_pose = self.get_target_pose(self.target, tgt_offset=[-0.30, 0, 0.02])
         
         # Process depth if available
         if self.depth is not None:
@@ -246,13 +256,37 @@ class BoltFastenerNode(Node):
         if self.bolts_detection_info is not None:
             rgb = self.detector.draw(rgb, self.bolts_detection_info, self.bolts)
 
-        # Display performance metrics
-        rgb = cv2.putText(rgb, f'FPS: {self.fps:.1f} (avg: {self.rolling_avg_fps:.1f})', (10, 30), 
+        # Display performance metrics and status
+        y_offset = 30
+        line_height = 30
+        
+        # Performance metrics
+        rgb = cv2.putText(rgb, f'FPS: {self.fps:.2f}', (10, y_offset), 
                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        rgb = cv2.putText(rgb, f'Frame time: {self.frame_time*1000:.1f}ms', (10, 60), 
-                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        rgb = cv2.putText(rgb, f'update detection: {self.is_update_detection}', (10, 90), 
-                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        y_offset += line_height
+        
+        # Detection status
+        rgb = cv2.putText(rgb, f'Detection: {"ON" if self.is_update_detection else "OFF"}', (10, y_offset), 
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0) if self.is_update_detection else (0, 0, 255), 2)
+        y_offset += line_height
+        
+        # Target status
+        rgb = cv2.putText(rgb, f'Target: {self.target}', (10, y_offset), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        y_offset += line_height
+        
+        # Planning status
+        status_color = (0, 255, 0)  # Green for IDLE/COMPLETED
+        if self.armstrong_plan_status == ARMstrongPlanStatus.PLANNING:
+            status_color = (255, 255, 0)  # Yellow for PLANNING
+        elif self.armstrong_plan_status == ARMstrongPlanStatus.EXECUTING:
+            status_color = (0, 255, 255)  # Cyan for EXECUTING
+        elif self.armstrong_plan_status == ARMstrongPlanStatus.FAILED:
+            status_color = (0, 0, 255)  # Red for FAILED
+            
+        status_text = f'Planning: {self.planning_status_map.get(self.armstrong_plan_status, "UNKNOWN")}'
+        rgb = cv2.putText(rgb, status_text, (10, y_offset), 
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
 
         cv2.imshow('rgb', rgb)
 
@@ -279,7 +313,7 @@ class BoltFastenerNode(Node):
         target_rot = target_transform[1]
 
         return_pos = source_rot.apply(target_tls) + source_pos
-        return_rot = source_rot * target_rot
+        return_rot = source_rot * target_rot    
 
         return (return_pos, return_rot)
     
