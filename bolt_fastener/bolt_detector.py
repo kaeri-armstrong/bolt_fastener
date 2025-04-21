@@ -56,7 +56,7 @@ class BoltDetector:
             s = f'{group_id}-{idx}: {conf:.2f}'
             img = cv2.putText(img, s, loc[:2], cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             img = cv2.rectangle(img, loc[:2], loc[2:], (0, 255, 0), 2)
-            if self.cam_info != {}:
+            if self.cam_info != {} and len(bolts) > 0:
                 name, tvec, rot = bolts[i]
                 # tvec = [tvec[1], tvec[0], tvec[2]]
                 rvec = rot.as_rotvec()
