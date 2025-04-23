@@ -100,8 +100,6 @@ class PointCloudProcessor:
                                     force_single_estimation: bool=False,
                                     ) -> Tuple[List[Tuple[str, NDArray[np.int_], Rotation]], DetectionResult] | None:
         point_cloud = self.convert_depth_to_point_cloud(depth)
-        if len(point_cloud.shape) != 3:
-            return
         center_pixel = detection.center_pixel
         center_point: NDArray[np.float_] = point_cloud[center_pixel[:, 1], center_pixel[:, 0]]
         detection.center_point = center_point

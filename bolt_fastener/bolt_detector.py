@@ -1,5 +1,6 @@
 from typing import List
 from numpy.typing import NDArray, ArrayLike
+import torch
 
 from scipy.spatial.transform import Rotation
 
@@ -7,6 +8,7 @@ from ultralytics import YOLO
 from ultralytics.engine.results import Boxes
 import cv2
 import numpy as np
+from armstrong_py.filters import ExponentialMovingAverage
 
 
 class BoltDetector:
@@ -14,17 +16,17 @@ class BoltDetector:
         self.model = YOLO(model_path)
         self.conf_threshold = 0.5
         self.cam_info = {}
+        self.alpha = 0.1  # (1/15)/((1/15)+0.1)
+        self.box_smoothing = {}  # Dictionary to store moving averages for each box ID
 
     def detect(self, img: NDArray) -> Boxes | None:
-        res = self.model.predict(img, )
+        res = self.model.predict(img)
         if res is None:
             return None
         if res[0].boxes is None:
             return None
         
-        box = res[0].boxes
-        
-        return box.cpu()
+        return res[0].boxes
     
     def track(self, img: NDArray) -> 'DetectionResult | None':
         res = self.model.track(img, persist=True, verbose=False)
@@ -33,12 +35,22 @@ class BoltDetector:
         if res[0].boxes is None:
             return None
 
-        if (res[0].boxes.id is None 
-            or res[0].boxes.conf is None 
-            or res[0].boxes.xyxy is None):
-            return
+        boxes = res[0].boxes.cpu()
+        if boxes.id is None or boxes.conf is None or boxes.xyxy is None:
+            return None
 
-        return DetectionResult(res[0].boxes)
+        # Apply smoothing to bounding boxes
+        for i, box_id in enumerate(boxes.id):
+            if box_id not in self.box_smoothing:
+                # Initialize moving average for new box
+                self.box_smoothing[box_id] = ExponentialMovingAverage(self.alpha)
+            
+            # Update moving average and get smoothed coordinates
+            with torch.inference_mode(True):
+                smoothed_coords = self.box_smoothing[box_id].update(boxes.xyxy[i])
+                boxes.xyxy[i] = smoothed_coords
+        
+        return DetectionResult(boxes)
     
     def draw(self, img: NDArray, detection: 'DetectionResult', bolts: List[tuple[str, NDArray, Rotation]]) -> NDArray:
         to_zipped = [detection.xyxy,
@@ -56,6 +68,7 @@ class BoltDetector:
             s = f'{group_id}-{idx}: {conf:.2f}'
             img = cv2.putText(img, s, loc[:2], cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             img = cv2.rectangle(img, loc[:2], loc[2:], (0, 255, 0), 2)
+            img = cv2.circle(img, np.mean((loc[:2], loc[2:]), axis=0).astype(np.int32), 5, (0, 0, 255), -1)
             if self.cam_info != {} and len(bolts) > 0:
                 name, tvec, rot = bolts[i]
                 # tvec = [tvec[1], tvec[0], tvec[2]]

@@ -1,6 +1,8 @@
-from typing import Tuple, Optional, Literal, List
+from typing import Tuple, Optional, Literal, List, Callable
 from copy import deepcopy
 from collections import namedtuple
+import subprocess
+
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -9,17 +11,26 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.qos import qos_profile_system_default
+from rclpy.parameter import parameter_value_to_python
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+# from ultralytics import SAM
 
 from ament_index_python import get_package_share_directory
 
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener, StaticTransformBroadcaster
 
-from sensor_msgs.msg import CameraInfo, CompressedImage, JointState
+from rcl_interfaces.msg import Parameter, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
+
+from sensor_msgs.msg import CameraInfo, CompressedImage, JointState, Imu
 from geometry_msgs.msg import TransformStamped, Pose, Transform
 
 from ass_msgs.msg import ARMstrongKinematics, ARMstrongPlanRequest, ARMstrongPlanStatus
 
 from armstrong_py.conversions import ros_pos_to_np_pos, ros_quat_to_rotation, list_to_ros_vec3, list_to_ros_point, rot_to_ros_quat
+from armstrong_py.filters import ExponentialMovingAverage
+from armstrong_py.utils import wait_until_future_complete
 
 from bolt_fastener.bolt_detector import BoltDetector, DetectionResult
 from bolt_fastener.point_cloud_processor import PointCloudProcessor
@@ -46,12 +57,14 @@ class BoltFastenerNode(Node):
         
         # Setup publishers
         self._setup_publishers()
+
+        self._setup_clients()
         
         # Setup visualization
         self._setup_visualization()
         
-        # Setup timers
-        self._setup_timers()
+        # Setup loops
+        self._setup_loops()
         
         # Setup status maps
         self._setup_status_maps()
@@ -76,8 +89,9 @@ class BoltFastenerNode(Node):
         # Target tracking
         self.target = None
         self.target_pose = None
-        self.docking_status: Literal['IDLE', 'DOCKING', 'DOCKED', 'FAILED'] = 'IDLE'
+        self._status: Literal['IDLE', 'ALIGNING', 'ALIGNED', 'TUNED', 'DOCKING', 'DOCKED', 'INSERTING', 'INSERTED', 'FAILED'] = 'IDLE'
         self.docking_pose = None
+        self.insert_translation = [0.0, 0.0, 0.0]  # Initialize insert translation vector
         
         # Head camera state
         self.head_depth_intrinsics = {}
@@ -96,8 +110,6 @@ class BoltFastenerNode(Node):
         self.hand_detection: DetectionResult | None = None
         self.hand_bolts_detection_info: DetectionResult | None = None
         self.hand_rgb: np.ndarray | None = None
-        self.hand_depth: np.ndarray | None = None
-        self.hand_depth_intrinsics = {}
         self.hand_rgb_intrinsics = {}
         self.is_hand_update_detection: bool = True
         
@@ -108,6 +120,10 @@ class BoltFastenerNode(Node):
         self.is_camera_head: bool = True
         self.box_scale = 0.
         self.projected_bolt_box_area = None
+        self.imu_ori = Rotation.identity()  # imu orientation wrt. ground (gravity)
+
+        self.reentrant_group = ReentrantCallbackGroup()
+        self.mutex_group = MutuallyExclusiveCallbackGroup()
 
     def _setup_tf(self):
         """Setup TF listeners and broadcasters"""
@@ -157,24 +173,28 @@ class BoltFastenerNode(Node):
             msg_type=CompressedImage,
             topic=self.tcp_tunnel_prefix + self.camera_namespace + self.head_camera_name + '/color/image_raw/compressed',
             callback=self.on_head_image_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
         self.depth_sub = self.create_subscription(
             msg_type=CompressedImage,
             topic=self.tcp_tunnel_prefix + self.camera_namespace + self.head_camera_name + '/aligned_depth_to_color/image_raw/compressedDepth',
-            callback=self.on_depth_update,
+            callback=self.on_head_depth_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
         self.depth_info_sub = self.create_subscription(
             msg_type=CameraInfo,
             topic=self.camera_namespace + self.head_camera_name + "/aligned_depth_to_color/camera_info",
             callback=self.on_head_depth_info_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
         self.head_rgb_info_sub = self.create_subscription(
             msg_type=CameraInfo,
             topic=self.camera_namespace + self.head_camera_name + "/color/camera_info",
             callback=self.on_head_rgb_info_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
 
@@ -184,18 +204,35 @@ class BoltFastenerNode(Node):
             msg_type=CompressedImage,
             topic=self.tcp_tunnel_prefix + self.camera_namespace + self.hand_camera_name + '/color/image_raw/compressed',
             callback=self.on_hand_image_update,
+            callback_group=self.reentrant_group,
+            qos_profile=qos_profile_system_default,
+        )
+        self.hand_depth_sub = self.create_subscription(
+            msg_type=CompressedImage,
+            topic=self.tcp_tunnel_prefix + self.camera_namespace + self.hand_camera_name + '/aligned_depth_to_color/image_raw/compressedDepth',
+            callback=self.on_hand_depth_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
         self.hand_depth_info_sub = self.create_subscription(
             msg_type=CameraInfo,
             topic=self.camera_namespace + self.hand_camera_name + "/aligned_depth_to_color/camera_info",
             callback=self.on_hand_depth_info_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
         self.hand_rgb_info_sub = self.create_subscription(
             msg_type=CameraInfo,
             topic=self.camera_namespace + self.hand_camera_name + "/color/camera_info",
             callback=self.on_hand_rgb_info_update,
+            callback_group=self.reentrant_group,
+            qos_profile=qos_profile_system_default,
+        )
+        self.hand_imu_sub = self.create_subscription(
+            msg_type=Imu,
+            topic="/imu/data",
+            callback=self.on_hand_imu_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
 
@@ -205,18 +242,21 @@ class BoltFastenerNode(Node):
             msg_type=JointState,
             topic='joint_states',
             callback=self.on_joint_state_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
         self.right_arm_kinematics_sub = self.create_subscription(
             msg_type=ARMstrongKinematics,
             topic='right_arm_kinematics',
             callback=self.on_right_arm_kinematics_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
         self.armstrong_plan_status_sub = self.create_subscription(
             msg_type=ARMstrongPlanStatus,
             topic="armstrong_plan_status",
             callback=self.on_armstrong_plan_status_update,
+            callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
 
@@ -226,7 +266,19 @@ class BoltFastenerNode(Node):
             msg_type=ARMstrongPlanRequest, 
             topic='armstrong_plan_request', 
             qos_profile=qos_profile_system_default,
+            callback_group=self.reentrant_group,
         )
+
+    def _setup_clients(self):
+        """Setup all clients"""
+        def get_param():
+            res = subprocess.run(['ros2', 'param', 'get', 'backass', 'offset.R6'], capture_output=True, text=True)
+            return float(res.stdout.split()[-1])
+        def set_param(value):
+            subprocess.run(['ros2', 'param', 'set', 'backass', 'offset.R6', str(value)])
+        self.get_param: Callable[[], float] = get_param
+        self.set_param: Callable[[float], None] = set_param
+
 
     def _setup_visualization(self):
         """Setup visualization windows and trackbars"""
@@ -250,19 +302,34 @@ class BoltFastenerNode(Node):
         cv2.setTrackbarPos('Confidence', 'hand_rgb', 50)
         cv2.setMouseCallback('hand_rgb', self.on_hand_mouse_event)
 
-    def _setup_timers(self):
-        """Setup timers for visualization and updates"""
+        # Hand depth visualization
+        cv2.namedWindow('hand_depth')
+        cv2.createTrackbar('Min Depth', 'hand_depth', 0, 1000, lambda x: None)
+        cv2.createTrackbar('Max Depth', 'hand_depth', 0, 1000, lambda x: None)
+        cv2.setTrackbarPos('Min Depth', 'hand_depth', 0)
+        cv2.setTrackbarPos('Max Depth', 'hand_depth', 1000)
+
+    def _setup_loops(self):
+        """Setup loops for visualization and updates"""
         # Head camera timer
-        self.head_draw_timer = self.create_timer(1/30, self.on_head_draw_timer)
+        self.head_draw_timer = self.create_timer(1/30, self.on_head_draw_timer, callback_group=self.reentrant_group)
         self.head_prev_time = self.get_clock().now()
         self.head_frame_time = []
         self.head_fps = 0.
 
         # Hand camera timer
-        self.hand_draw_timer = self.create_timer(1/30, self.on_hand_draw_timer)
+        self.hand_draw_timer = self.create_timer(1/30, self.on_hand_draw_timer, callback_group=self.reentrant_group)
         self.hand_prev_time = self.get_clock().now()
         self.hand_frame_time = []
         self.hand_fps = 0.
+        
+        self.future_done = False
+
+        # Control timer for robot motion
+        self.control_timer = self.create_timer(1/10, self.on_control_loop, callback_group=self.mutex_group)  # 10Hz control rate
+        # self.control_loop = threading.Thread(target=self.on_control_loop)
+        # self.control_loop.start()
+
 
     def _setup_status_maps(self):
         """Setup status mapping dictionaries"""
@@ -316,7 +383,7 @@ class BoltFastenerNode(Node):
         if res is not None:
             self.hand_detection = res
 
-    def on_depth_update(self, msg: CompressedImage):
+    def on_head_depth_update(self, msg: CompressedImage):
         """Process head camera depth image update"""
         # Decode depth image
         buf = np.frombuffer(msg.data, dtype=np.uint8)
@@ -359,18 +426,6 @@ class BoltFastenerNode(Node):
         self.head_processor.set_depth_intrinsics(depth_intrinsics)
         self.head_detector.cam_info = depth_intrinsics
 
-    def on_hand_depth_info_update(self, info: CameraInfo):
-        """Update hand camera depth intrinsics"""
-        hand_depth_intrinsics = {
-            'fx': info.k[0], 'fy': info.k[4], 
-            'cx': info.k[2], 'cy': info.k[5], 
-            'width': info.width, 'height': info.height, 
-            'mtx': np.array(info.k).reshape(3, 3), 
-            'dist': np.array(info.d)
-        }
-        self.hand_depth_intrinsics = hand_depth_intrinsics
-        self.hand_processor.set_depth_intrinsics(hand_depth_intrinsics)
-        self.hand_detector.cam_info = hand_depth_intrinsics
 
     def on_head_rgb_info_update(self, info: CameraInfo):
         """Update head camera RGB intrinsics"""
@@ -391,6 +446,9 @@ class BoltFastenerNode(Node):
             'mtx': np.array(info.k).reshape(3, 3), 
             'dist': np.array(info.d)
         }
+    def on_hand_imu_update(self, msg: Imu):
+        """Update hand camera IMU"""
+        self.imu_ori = Rotation.from_quat([msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
 
     def on_joint_state_update(self, msg: JointState):
         """Update joint state"""
@@ -405,6 +463,10 @@ class BoltFastenerNode(Node):
     def on_armstrong_plan_status_update(self, msg: ARMstrongPlanStatus):
         """Update armstrong plan status"""
         self.armstrong_plan_status = msg.status
+        if self.armstrong_plan_status == ARMstrongPlanStatus.COMPLETED and self.status == 'ALIGNING':
+            self.status = 'ALIGNED'
+        elif self.armstrong_plan_status == ARMstrongPlanStatus.FAILED:
+            self.status = 'FAILED'
 
     def on_head_mouse_event(self, event: int, x: int, y: int, flags: int, params=None) -> None:
         """Handle mouse events on head camera view"""
@@ -414,13 +476,14 @@ class BoltFastenerNode(Node):
         if event == cv2.EVENT_LBUTTONDOWN:
             for i, (x1, y1, x2, y2) in enumerate(self.head_bolts_detection_info.xyxy):
                 if x1 <= x <= x2 and y1 <= y <= y2:
+                    self.status = 'ALIGNING'
                     target = self.set_target(
                         box_id=self.head_bolts_detection_info.box_id[i],
                         group_id=self.head_bolts_detection_info.group_id[i] 
                             if self.head_bolts_detection_info.group_id is not None 
                             else None
                     )
-                    self.target_pose = self.get_target_pose(target, tgt_offset=[-0.50, 0, 0.02])
+                    self.target_pose = self.get_target_pose(target, tgt_offset=[-0.30, 0, -0.075])
                     if self.target_pose is not None:
                         self.follow_target(self.target_pose)
                     return
@@ -433,10 +496,10 @@ class BoltFastenerNode(Node):
         if event == cv2.EVENT_LBUTTONDOWN:
             for i, (x1, y1, x2, y2) in enumerate(self.hand_detection.xyxy):
                 if x1 <= x <= x2 and y1 <= y <= y2:
-                    self.get_logger().info(f"Target set to: {self.target}")
                     self.target = self.make_bolt_name(self.hand_detection.box_id[i], '', 'hand')
-                    self.docking_status = 'DOCKING'
+                    self.get_logger().info(f"Target set to: {self.target}")
                     self.docking_pose = self.get_transform('origin', 'r_link6')
+                    self.status = 'DOCKING'
 
     def on_head_draw_timer(self):
         """Update head camera visualization"""
@@ -454,9 +517,9 @@ class BoltFastenerNode(Node):
         self.head_fps = 1 / np.mean(self.head_frame_time) * 1e9
         self.head_prev_time = current_time
         
-        # Update target pose if target is set
-        if self.target is not None and 'head' in self.target:
-            self.target_pose = self.get_target_pose(self.target, tgt_offset=[-0.50, 0, 0.0])
+        # # Update target pose if target is set
+        # if self.target is not None and 'head' in self.target:
+        #     self.target_pose = self.get_target_pose(self.target, tgt_offset=[-0.30, 0, -0.05])
  
         # Draw detections if available
         if self.head_bolts_detection_info is not None:
@@ -492,9 +555,8 @@ class BoltFastenerNode(Node):
         if self.hand_detection is not None:
             rgb = self.hand_detector.draw(rgb, self.hand_detection, self.hand_bolts)
 
-        # Draw target boxes and handle docking
+        # Draw target boxes
         self._draw_target_boxes(rgb)
-        self._handle_docking(rgb)
 
         # Display status information
         self._draw_status_info(rgb)
@@ -502,15 +564,61 @@ class BoltFastenerNode(Node):
         # Show image
         cv2.imshow('hand_rgb', rgb)
 
+    def on_future_done(self, future):
+        self.future_done = True
+        
+    def on_control_loop(self):
+        """Handle robot motion control at a fixed rate"""
+
+        if self.target is None or 'hand' not in self.target:
+            return        
+        if self.status in 'DOCKING':
+            self._handle_docking_control()
+        elif self.status == 'INSERTING':
+            self._handle_inserting_control() 
+
+    def _handle_docking_control(self):
+        """Handle docking control logic"""
+        if (self.target is not None 
+            and 'hand' in self.target 
+            and self.status != 'DOCKED'
+            and self.hand_detection is not None
+            and len(self.hand_detection.center_pixel) > 0
+            and len(self.hand_detection.box_id) > 0):
+            
+            target_id = int(self.target.split('-')[-2])
+            target_indices = (self.hand_detection.box_id == target_id).nonzero()[0]
+            
+            if len(target_indices) > 0:
+                target_idx = target_indices[0]
+                target_point = self.hand_detection.center_pixel[target_idx]
+                target_bbox = self.hand_detection.xyxy[target_idx]
+                target_bbox_area = np.multiply(*(target_bbox[0:2] - target_bbox[2:]))
+
+                # Adjust tolerance based on target box area
+                box_ratio = target_bbox_area / self.projected_bolt_box_area
+                tolerance = 50
+                center_px = (self.hand_rgb_intrinsics['width'] // 2, self.hand_rgb_intrinsics['height'] // 2)
+                box = np.array([center_px[0] - tolerance, center_px[1] - tolerance, 
+                              center_px[0] + tolerance, center_px[1] + tolerance]).astype(np.int32)
+                
+                self.perform_docking_by_box(box, target_bbox_area, target_point)
+
+    def _handle_inserting_control(self):
+        """Handle inserting control logic"""
+        if self.status == 'INSERTING':
+            self.get_logger().info(f"Inserting status: {self.status}")
+            self.perform_inserting(self.insert_translation)
+
     def _setup_projected_bolt_box(self):
         """Setup projected bolt box for hand camera"""
         if self.projected_bolt_box_area is None:
             bolt_size = 0.036
-            target_z = 0.10
+            self.target_z = 0.10
 
             self.bolt_box = np.array([
-                [-bolt_size/2, -bolt_size/2, target_z],
-                [bolt_size/2, bolt_size/2, target_z],
+                [-bolt_size/2, -bolt_size/2, self.target_z],
+                [bolt_size/2, bolt_size/2, self.target_z],
             ])
             self.projected_bolt_box = cv2.projectPoints(
                 self.bolt_box, 
@@ -529,43 +637,7 @@ class BoltFastenerNode(Node):
         box = np.array([center_px[0] - tolerance, center_px[1] - tolerance, 
                        center_px[0] + tolerance, center_px[1] + tolerance]).astype(np.int32)
         rgb = cv2.rectangle(rgb, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
-        rgb = cv2.rectangle(rgb, self.projected_bolt_box[0], self.projected_bolt_box[1], (0, 255, 0), 2)
-
-    def _handle_docking(self, rgb):
-        """Handle docking process for hand camera"""
-        if (self.target is not None 
-            and 'hand' in self.target 
-            and self.docking_status != 'DOCKED'
-            and self.hand_detection is not None
-            and len(self.hand_detection.center_pixel) > 0
-            and len(self.hand_detection.box_id) > 0):
-            
-            target_id = int(self.target.split('-')[-2])
-            target_indices = (self.hand_detection.box_id == target_id).nonzero()[0]
-            
-            if len(target_indices) > 0:
-                target_idx = target_indices[0]
-                target_point = self.hand_detection.center_pixel[target_idx]
-                target_bbox = self.hand_detection.xyxy[target_idx]
-                target_bbox_area = np.multiply(*(target_bbox[0:2] - target_bbox[2:]))
-
-                # Adjust tolerance based on target box area
-                box_ratio = target_bbox_area / self.projected_bolt_box_area
-                tolerance = 50 - 40 * box_ratio
-                center_px = (self.hand_rgb_intrinsics['width'] // 2, self.hand_rgb_intrinsics['height'] // 2)
-                box = np.array([center_px[0] - tolerance, center_px[1] - tolerance, 
-                              center_px[0] + tolerance, center_px[1] + tolerance]).astype(np.int32)
-                
-                self.target_transform = self.perform_docking_by_box(box, target_bbox_area, target_point)
-                
-                # Draw target information
-                rgb = cv2.rectangle(rgb, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2, lineType=cv2.LINE_4)
-                rgb = cv2.putText(rgb, f'target_point: {target_point}', (10, 150), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                rgb = cv2.putText(rgb, f'center_pixel: {self.hand_detection.center_pixel[target_idx]}', (10, 180), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                rgb = cv2.putText(rgb, f'box_ratio: {box_ratio:.2f}', (10, 210), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        rgb = cv2.rectangle(rgb, self.projected_bolt_box[0], self.projected_bolt_box[1], (255, 255, 0), 2)
 
     def _draw_status_info(self, rgb):
         """Draw status information on image"""
@@ -599,6 +671,9 @@ class BoltFastenerNode(Node):
         status_text = f'Planning: {self.planning_status_map.get(self.armstrong_plan_status, "UNKNOWN")}'
         rgb = cv2.putText(rgb, status_text, (10, y_offset), 
                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
+        y_offset += line_height
+        rgb = cv2.putText(rgb, f'Status: {self.status}', (10, y_offset), 
+                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 2)
 
     def _handle_keyboard_input(self):
         """Handle keyboard input for head camera view"""
@@ -610,6 +685,19 @@ class BoltFastenerNode(Node):
             self.toggle_fix_pose()
         elif k == ord('r'):
             self.armstrong_plan_status = ARMstrongPlanStatus.IDLE
+        elif k == ord('a'):
+            self._set_offset_by_imu()
+        elif k == ord('i'):
+            self.status = 'INSERTING'
+
+    def _set_offset_by_imu(self):
+        offset = self.get_param()
+        p, y, r  = self.imu_ori.as_euler('xyz', degrees=True)  # as imu's axis differs with robot (X: Right, Y: Down, Z: Forward)
+        p += 90
+        self.get_logger().info(f"Applying offset: {offset} - {p}")
+        offset += p
+        self.set_param(offset)
+        self.status = 'TUNED'
 
     def set_target(self, box_id, group_id, prefix: Literal['head', 'hand'] = 'head') -> str:
         """Set target bolt for tracking"""
@@ -628,11 +716,12 @@ class BoltFastenerNode(Node):
         center_px = (self.hand_rgb_intrinsics['width'] / 2, self.hand_rgb_intrinsics['height'] / 2)
         box_area = abs((box[0] - box[2]) * (box[1] - box[3]))
 
-        self.docking_pose.translation.x += 0.01
         if box[0] <= t_x <= box[2] and box[1] <= t_y <= box[3]:
             if box_area > self.projected_bolt_box_area:
-                self.docking_status = 'DOCKED'
+                self.status = 'DOCKED'
                 return
+            else:
+                self.docking_pose.translation.x += 0.01
         else:
             if t_x < box[0]:
                 self.docking_pose.translation.y += 0.01
@@ -667,23 +756,27 @@ class BoltFastenerNode(Node):
         assert self.docking_pose is not None
         if self.armstrong_plan_status not in [ARMstrongPlanStatus.IDLE, ARMstrongPlanStatus.COMPLETED, ARMstrongPlanStatus.FAILED]:
             return
-
+        
         t_x, t_y = target_point
-        if target_bbox_area >= self.projected_bolt_box_area:
-            self.docking_status = 'DOCKED'
+        is_in_box = tol_box[0] <= t_x <= tol_box[2] and tol_box[1] <= t_y <= tol_box[3]
+        is_far_from_box = target_bbox_area < self.projected_bolt_box_area
+        box_ratio = target_bbox_area / self.projected_bolt_box_area
+        move_step = 0.01 - 0.0075 * box_ratio
+        self.get_logger().info(f"Move step: {move_step}")
+        if is_in_box and not is_far_from_box:
+            self.status = 'DOCKED'
             return
-        else:
-            self.docking_pose.translation.x += 0.01
-            
-        if t_x < tol_box[0]:
-            self.docking_pose.translation.y += 0.01
-        elif t_x > tol_box[2]:
-            self.docking_pose.translation.y -= 0.01
-        if t_y < tol_box[1]:
-            self.docking_pose.translation.z += 0.01
-        elif t_y > tol_box[3]:
-            self.docking_pose.translation.z -= 0.01
-
+        elif is_in_box and is_far_from_box:
+            self.docking_pose.translation.x += (move_step + 0.1 * (1 - box_ratio)**2)
+        else:  # not in box and far from box
+            if t_x < tol_box[0]:
+                self.docking_pose.translation.y += move_step
+            elif t_x > tol_box[2]:
+                self.docking_pose.translation.y -= move_step
+            if t_y < tol_box[1]:
+                self.docking_pose.translation.z += move_step
+            elif t_y > tol_box[3]:  
+                self.docking_pose.translation.z -= move_step
         docking_pose = Pose()
         docking_pose.position.x = self.docking_pose.translation.x
         docking_pose.position.y = self.docking_pose.translation.y
@@ -694,6 +787,23 @@ class BoltFastenerNode(Node):
             group_name='right_arm',
             link_name='r_link6',
             target_pose=docking_pose,
+            wait_after_complete=1.0,
+            vel_scale=0.05,
+        )
+        self.armstrong_plan_pub.publish(msg)
+
+    def perform_inserting(self, target_tls: List):
+        assert self.docking_pose is not None
+        target_pose = Pose()
+        target_pose.position.x = self.docking_pose.translation.x + self.insert_translation[0]
+        target_pose.position.y = self.docking_pose.translation.y + self.insert_translation[1]
+        target_pose.position.z = self.docking_pose.translation.z + self.insert_translation[2]
+        target_pose.orientation = self.docking_pose.rotation
+        """Perform inserting operation"""
+        msg = self.build_armstrong_plan_request(
+            group_name='right_arm',
+            link_name='r_link6',
+            target_pose=target_pose,
             wait_after_complete=1.0,
             vel_scale=0.05,
         )
@@ -861,6 +971,43 @@ class BoltFastenerNode(Node):
 
         return msg
 
+    def on_hand_depth_update(self, msg: CompressedImage):
+        """Process hand camera depth image update"""
+        # Decode depth image
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        depth = cv2.imdecode(buf[12:], cv2.IMREAD_UNCHANGED)
+        self.hand_depth = depth.astype(np.float32) / 1000  # Convert to meters
+
+        # Get depth range from trackbars
+        min_depth = cv2.getTrackbarPos('Min Depth', 'hand_depth') / 1000.0  # Convert to meters
+        max_depth = cv2.getTrackbarPos('Max Depth', 'hand_depth') / 1000.0  # Convert to meters
+
+        # Normalize depth for visualization
+        depth_vis = np.clip((depth - min_depth * 1000) / ((max_depth - min_depth) * 1000), 0, 1)
+        depth_vis = (depth_vis * 255).astype(np.uint8)
+        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+
+        # Show depth image
+        cv2.imshow('hand_depth', depth_vis)
+
+    def on_hand_depth_info_update(self, info: CameraInfo):
+        """Update hand camera depth intrinsics"""
+        self.hand_depth_intrinsics = {
+            'fx': info.k[0], 'fy': info.k[4], 
+            'cx': info.k[2], 'cy': info.k[5], 
+            'width': info.width, 'height': info.height, 
+            'mtx': np.array(info.k).reshape(3, 3), 
+            'dist': np.array(info.d)
+        }
+
+    @property
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, value):
+        self.get_logger().info(f"Status Changed: {self._status} -> {value}")
+        self._status = value
 
 def main():
     """Main function"""
