@@ -100,6 +100,23 @@ class DetectionResult:
     
     def __len__(self):
         return len(self.xyxy)
+    
+    def __getitem__(self, idx_: int | str):
+        if isinstance(idx_, str):
+            s = idx_.split('-')
+            idx_ = int(s[-2])
+
+        idx = (self.box_id == idx_).nonzero()[0][0]
+        
+        it = DetectionResult([
+                    self.xyxy[idx],
+                    self.box_id[idx],
+                    self.confidence[idx],
+                    self.center_pixel[idx],
+                    self.center_point[idx] if self.center_point is not None else None,
+                    self.group_id[idx] if self.group_id is not None else None
+                ])
+        return it
 
     def filter_with_mask(self, mask: np.ndarray, inplace=True):
         if inplace:

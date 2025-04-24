@@ -98,7 +98,12 @@ class PointCloudProcessor:
                                     roi_offset: float=0.1,
                                     radius: float=0.04,
                                     force_single_estimation: bool=False,
+                                    estimate_only: Optional[str] = None
                                     ) -> Tuple[List[Tuple[str, NDArray[np.int_], Rotation]], DetectionResult] | None:
+        
+        if estimate_only is not None:
+            detection = detection[estimate_only]
+
         point_cloud = self.convert_depth_to_point_cloud(depth)
         center_pixel = detection.center_pixel
         center_point: NDArray[np.float_] = point_cloud[center_pixel[:, 1], center_pixel[:, 0]]

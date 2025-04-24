@@ -1,6 +1,4 @@
 from typing import Tuple, Optional, Literal, List, Callable
-from copy import deepcopy
-from collections import namedtuple
 import subprocess
 
 import cv2
@@ -11,26 +9,20 @@ import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
 from rclpy.qos import qos_profile_system_default
-from rclpy.parameter import parameter_value_to_python
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 # from ultralytics import SAM
 
 from ament_index_python import get_package_share_directory
 
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener, StaticTransformBroadcaster
 
-from rcl_interfaces.msg import Parameter, ParameterValue
-from rcl_interfaces.srv import GetParameters, SetParameters
 
 from sensor_msgs.msg import CameraInfo, CompressedImage, JointState, Imu
 from geometry_msgs.msg import TransformStamped, Pose, Transform
 
-from ass_msgs.msg import ARMstrongKinematics, ARMstrongPlanRequest, ARMstrongPlanStatus
+from ass_msgs.msg import ARMstrongKinematics, ARMstrongPlanRequest, ARMstrongPlanStatus, DXLCommand
 
 from armstrong_py.conversions import ros_pos_to_np_pos, ros_quat_to_rotation, list_to_ros_vec3, list_to_ros_point, rot_to_ros_quat
-from armstrong_py.filters import ExponentialMovingAverage
-from armstrong_py.utils import wait_until_future_complete
 
 from bolt_fastener.bolt_detector import BoltDetector, DetectionResult
 from bolt_fastener.point_cloud_processor import PointCloudProcessor
@@ -58,6 +50,7 @@ class BoltFastenerNode(Node):
         # Setup publishers
         self._setup_publishers()
 
+        # Setup clients
         self._setup_clients()
         
         # Setup visualization
@@ -92,7 +85,8 @@ class BoltFastenerNode(Node):
         self._status: Literal['IDLE', 'ALIGNING', 'ALIGNED', 'TUNED', 'DOCKING', 'DOCKED', 'INSERTING', 'INSERTED', 'FAILED'] = 'IDLE'
         self.docking_pose = None
         self.insert_translation = [0.0, 0.0, 0.0]  # Initialize insert translation vector
-        
+        self.tolerance = 25  # px
+
         # Head camera state
         self.head_depth_intrinsics = {}
         self.head_rgb_intrinsics = {}
@@ -110,12 +104,13 @@ class BoltFastenerNode(Node):
         self.hand_detection: DetectionResult | None = None
         self.hand_bolts_detection_info: DetectionResult | None = None
         self.hand_rgb: np.ndarray | None = None
+        self.hand_depth: np.ndarray | None = None
         self.hand_rgb_intrinsics = {}
+        self.hand_depth_intrinsics = {}
         self.is_hand_update_detection: bool = True
         
         # Robot state
         self.joint_state: np.ndarray | None = None
-        self.r_pose: Tuple[np.ndarray, Rotation] = (np.zeros(3), Rotation.identity())
         self.armstrong_plan_status = ARMstrongPlanStatus.IDLE
         self.is_camera_head: bool = True
         self.box_scale = 0.
@@ -245,13 +240,6 @@ class BoltFastenerNode(Node):
             callback_group=self.reentrant_group,
             qos_profile=qos_profile_system_default,
         )
-        self.right_arm_kinematics_sub = self.create_subscription(
-            msg_type=ARMstrongKinematics,
-            topic='right_arm_kinematics',
-            callback=self.on_right_arm_kinematics_update,
-            callback_group=self.reentrant_group,
-            qos_profile=qos_profile_system_default,
-        )
         self.armstrong_plan_status_sub = self.create_subscription(
             msg_type=ARMstrongPlanStatus,
             topic="armstrong_plan_status",
@@ -265,6 +253,12 @@ class BoltFastenerNode(Node):
         self.armstrong_plan_pub = self.create_publisher(
             msg_type=ARMstrongPlanRequest, 
             topic='armstrong_plan_request', 
+            qos_profile=qos_profile_system_default,
+            callback_group=self.reentrant_group,
+        )
+        self.dxl_command_pub = self.create_publisher(
+            msg_type=DXLCommand,
+            topic='dxl_command',
             qos_profile=qos_profile_system_default,
             callback_group=self.reentrant_group,
         )
@@ -326,7 +320,7 @@ class BoltFastenerNode(Node):
         self.future_done = False
 
         # Control timer for robot motion
-        self.control_timer = self.create_timer(1/10, self.on_control_loop, callback_group=self.mutex_group)  # 10Hz control rate
+        self.control_timer = self.create_timer(1/5, self.on_control_loop, callback_group=self.mutex_group)
         # self.control_loop = threading.Thread(target=self.on_control_loop)
         # self.control_loop.start()
 
@@ -340,9 +334,19 @@ class BoltFastenerNode(Node):
             ARMstrongPlanStatus.COMPLETED: "COMPLETED",
             ARMstrongPlanStatus.FAILED: "FAILED"
         }
+        
+        self.insert_status = {
+            'status': 'IDLE',
+            'status_list': ['IDLE', 'APPROACH', 'INSERT', 'RETRACT', 'COMPLETED'],
+            'APPROACH': (0, 0, 0.09),
+            'INSERT': (0.025, 0, 0),
+            'RETRACT': (-0.1, 0, 0)
+        }
 
     def on_head_image_update(self, msg: CompressedImage):
         """Process head camera RGB image update"""
+        if self.head_rgb_intrinsics == {}:
+            return
         contrast = cv2.getTrackbarPos('Contrast', 'head_rgb')
         brightness = cv2.getTrackbarPos("Brightness", 'head_rgb')
         self.head_confidence_threshold = cv2.getTrackbarPos("Confidence", 'head_rgb') / 100.0
@@ -352,7 +356,7 @@ class BoltFastenerNode(Node):
         buf = np.ndarray(shape=(1, len(str_msg)), dtype=np.uint8, buffer=msg.data)
         image = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         img = image.astype(np.uint8)
-        
+        img = cv2.undistort(img, self.head_rgb_intrinsics['mtx'], self.head_rgb_intrinsics['dist'])
         # Apply contrast and brightness
         img = cv2.convertScaleAbs(img, alpha=(contrast-50.0)/50+1, beta=brightness-50)
         self.head_rgb = img
@@ -364,6 +368,8 @@ class BoltFastenerNode(Node):
 
     def on_hand_image_update(self, msg: CompressedImage):
         """Process hand camera RGB image update"""
+        if self.hand_rgb_intrinsics == {}:
+            return
         contrast = cv2.getTrackbarPos('Contrast', 'hand_rgb')
         brightness = cv2.getTrackbarPos("Brightness", 'hand_rgb')
         self.hand_confidence_threshold = cv2.getTrackbarPos("Confidence", 'hand_rgb') / 100.0
@@ -385,9 +391,12 @@ class BoltFastenerNode(Node):
 
     def on_head_depth_update(self, msg: CompressedImage):
         """Process head camera depth image update"""
+        if self.head_depth_intrinsics == {}:
+            return
         # Decode depth image
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         depth = cv2.imdecode(buf[12:], cv2.IMREAD_UNCHANGED)
+        depth = cv2.undistort(depth, self.head_depth_intrinsics['mtx'], self.head_depth_intrinsics['dist'])
         self.head_depth = depth.astype(np.float32) / 1000
 
         # Process bolt detection if conditions are met
@@ -412,6 +421,36 @@ class BoltFastenerNode(Node):
         # Publish transforms for detected bolts
         for b in self.head_bolts:
             self.publish_transform(b, 'head_camera_color_optical_frame')
+    
+    def on_hand_depth_update(self, msg: CompressedImage):
+        """Process hand camera depth image update"""
+        if self.hand_depth_intrinsics == {}:
+            return
+        # Decode depth image
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        depth = cv2.imdecode(buf[12:], cv2.IMREAD_UNCHANGED)
+        self.hand_depth = depth.astype(np.float32) / 1000  # Convert to meters
+
+        # if (self.hand_detection is not None 
+        #     and self.hand_depth_intrinsics != {} 
+        #     and self.hand_depth is not None
+        #     and self.is_hand_update_detection):
+            
+        #     res = self.hand_processor.estimate_bolt_pose_pipeline(
+        #         depth=self.hand_depth,
+        #         detection=self.hand_detection,
+        #         conf=self.hand_confidence_threshold,
+        #         crop_by_roi=True,
+        #         radius=0.015,
+        #         force_single_estimation=True)
+            
+        #     if res is None:
+        #         return
+            
+        #     self.hand_bolts, self.hand_bolts_detection_info = res
+        
+        # for b in self.hand_bolts:
+        #     self.publish_transform(b, 'hand_camera_color_optical_frame')
 
     def on_head_depth_info_update(self, info: CameraInfo):
         """Update head camera depth intrinsics"""
@@ -425,6 +464,18 @@ class BoltFastenerNode(Node):
         self.head_depth_intrinsics = depth_intrinsics
         self.head_processor.set_depth_intrinsics(depth_intrinsics)
         self.head_detector.cam_info = depth_intrinsics
+    
+    def on_hand_depth_info_update(self, info: CameraInfo):
+        """Update hand camera depth intrinsics"""
+        self.hand_depth_intrinsics = {
+            'fx': info.k[0], 'fy': info.k[4], 
+            'cx': info.k[2], 'cy': info.k[5], 
+            'width': info.width, 'height': info.height, 
+            'mtx': np.array(info.k).reshape(3, 3), 
+            'dist': np.array(info.d)
+        }
+        self.hand_processor.set_depth_intrinsics(self.hand_depth_intrinsics)
+        self.hand_detector.cam_info = self.hand_depth_intrinsics
 
 
     def on_head_rgb_info_update(self, info: CameraInfo):
@@ -454,18 +505,14 @@ class BoltFastenerNode(Node):
         """Update joint state"""
         self.joint_state = np.array(msg.position)
 
-    def on_right_arm_kinematics_update(self, msg: ARMstrongKinematics):
-        """Update right arm kinematics"""
-        pos = ros_pos_to_np_pos(msg.pose.position)
-        rot = ros_quat_to_rotation(msg.pose.orientation)
-        self.r_pose = (pos, rot)
-
     def on_armstrong_plan_status_update(self, msg: ARMstrongPlanStatus):
         """Update armstrong plan status"""
         self.armstrong_plan_status = msg.status
         if self.armstrong_plan_status == ARMstrongPlanStatus.COMPLETED and self.status == 'ALIGNING':
             self.status = 'ALIGNED'
         elif self.armstrong_plan_status == ARMstrongPlanStatus.FAILED:
+            if self.status == 'INSERTING':
+                self.insert_status['status'] = 'IDLE'
             self.status = 'FAILED'
 
     def on_head_mouse_event(self, event: int, x: int, y: int, flags: int, params=None) -> None:
@@ -483,7 +530,7 @@ class BoltFastenerNode(Node):
                             if self.head_bolts_detection_info.group_id is not None 
                             else None
                     )
-                    self.target_pose = self.get_target_pose(target, tgt_offset=[-0.30, 0, -0.075])
+                    self.target_pose = self.get_target_pose(target, tgt_offset=[-0.40, 0, -0.075])
                     if self.target_pose is not None:
                         self.follow_target(self.target_pose)
                     return
@@ -576,6 +623,8 @@ class BoltFastenerNode(Node):
             self._handle_docking_control()
         elif self.status == 'INSERTING':
             self._handle_inserting_control() 
+        elif self.status == 'FAILED':
+            self.insert_status['status'] = 'IDLE'
 
     def _handle_docking_control(self):
         """Handle docking control logic"""
@@ -597,28 +646,43 @@ class BoltFastenerNode(Node):
 
                 # Adjust tolerance based on target box area
                 box_ratio = target_bbox_area / self.projected_bolt_box_area
-                tolerance = 50
+                self.tolerance = 25
                 center_px = (self.hand_rgb_intrinsics['width'] // 2, self.hand_rgb_intrinsics['height'] // 2)
-                box = np.array([center_px[0] - tolerance, center_px[1] - tolerance, 
-                              center_px[0] + tolerance, center_px[1] + tolerance]).astype(np.int32)
+                box = np.array([center_px[0] - self.tolerance, center_px[1] - self.tolerance, 
+                              center_px[0] + self.tolerance, center_px[1] + self.tolerance]).astype(np.int32)
                 
                 self.perform_docking_by_box(box, target_bbox_area, target_point)
 
     def _handle_inserting_control(self):
         """Handle inserting control logic"""
-        if self.status == 'INSERTING':
-            self.get_logger().info(f"Inserting status: {self.status}")
-            self.perform_inserting(self.insert_translation)
+        if self.armstrong_plan_status not in [ARMstrongPlanStatus.IDLE, ARMstrongPlanStatus.COMPLETED, ARMstrongPlanStatus.FAILED]:
+            return
+
+        if self.insert_status['status'] == 'IDLE':
+            self.insert_status['status'] = 'APPROACH'
+        elif self.insert_status['status'] == 'COMPLETED':
+            self.insert_status['status'] = 'IDLE'
+            self.status = 'COMPLETED'
+            return
+        if self.insert_status['status'] == 'INSERT':
+            trigger = 600
+        else:
+            trigger = 512
+        
+        self.get_logger().info(f"Inserting status: {self.insert_status['status']}")
+        self.perform_inserting(self.insert_status[self.insert_status['status']], trigger)
+        status_idx = self.insert_status['status_list'].index(self.insert_status['status'])
+        self.insert_status['status'] = self.insert_status['status_list'][status_idx + 1]
 
     def _setup_projected_bolt_box(self):
         """Setup projected bolt box for hand camera"""
         if self.projected_bolt_box_area is None:
-            bolt_size = 0.036
-            self.target_z = 0.10
+            self.bolt_size = 0.036
+            self.target_z = 0.22
 
             self.bolt_box = np.array([
-                [-bolt_size/2, -bolt_size/2, self.target_z],
-                [bolt_size/2, bolt_size/2, self.target_z],
+                [-self.bolt_size/2, -self.bolt_size/2, self.target_z],
+                [self.bolt_size/2, self.bolt_size/2, self.target_z],
             ])
             self.projected_bolt_box = cv2.projectPoints(
                 self.bolt_box, 
@@ -632,10 +696,9 @@ class BoltFastenerNode(Node):
 
     def _draw_target_boxes(self, rgb):
         """Draw target boxes on hand camera view"""
-        tolerance = 50
         center_px = (self.hand_rgb_intrinsics['width'] // 2, self.hand_rgb_intrinsics['height'] // 2)
-        box = np.array([center_px[0] - tolerance, center_px[1] - tolerance, 
-                       center_px[0] + tolerance, center_px[1] + tolerance]).astype(np.int32)
+        box = np.array([center_px[0] - self.tolerance, center_px[1] - self.tolerance, 
+                       center_px[0] + self.tolerance, center_px[1] + self.tolerance]).astype(np.int32)
         rgb = cv2.rectangle(rgb, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
         rgb = cv2.rectangle(rgb, self.projected_bolt_box[0], self.projected_bolt_box[1], (255, 255, 0), 2)
 
@@ -689,12 +752,13 @@ class BoltFastenerNode(Node):
             self._set_offset_by_imu()
         elif k == ord('i'):
             self.status = 'INSERTING'
+            self.insert_pose = self.get_transform('origin', 'r_link6')
 
     def _set_offset_by_imu(self):
         offset = self.get_param()
         p, y, r  = self.imu_ori.as_euler('xyz', degrees=True)  # as imu's axis differs with robot (X: Right, Y: Down, Z: Forward)
         p += 90
-        self.get_logger().info(f"Applying offset: {offset} - {p}")
+        self.get_logger().info(f"Applying offset: {offset} + {p}")
         offset += p
         self.set_param(offset)
         self.status = 'TUNED'
@@ -749,6 +813,7 @@ class BoltFastenerNode(Node):
             wait_after_complete=1.0,
             vel_scale=0.05,
         )
+        self.armstrong_plan_status = ARMstrongPlanStatus.PLANNING
         self.armstrong_plan_pub.publish(msg)
 
     def perform_docking_by_box(self, tol_box, target_bbox_area, target_point):
@@ -760,23 +825,24 @@ class BoltFastenerNode(Node):
         t_x, t_y = target_point
         is_in_box = tol_box[0] <= t_x <= tol_box[2] and tol_box[1] <= t_y <= tol_box[3]
         is_far_from_box = target_bbox_area < self.projected_bolt_box_area
-        box_ratio = target_bbox_area / self.projected_bolt_box_area
-        move_step = 0.01 - 0.0075 * box_ratio
-        self.get_logger().info(f"Move step: {move_step}")
+        box_ratio = np.clip(target_bbox_area / self.projected_bolt_box_area, 0, 1)
+        cam_z = self.get_abstract_depth_from_box(self.bolt_size**2, target_bbox_area, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'])
+        cam_x, cam_y = self.get_coord_from_pixel(t_x, t_y, cam_z, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'])
+        center_x, center_y = self.get_coord_from_pixel(self.hand_rgb_intrinsics['width']//2, self.hand_rgb_intrinsics['height']//2, cam_z, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'])
+        x_move_step = cam_z / 2
+        y_move_step = - (cam_y - center_y) / 2
+        z_move_step = - (cam_x - center_x) / 2
+        self.get_logger().info(f"Cam z: {cam_z}, cam x: {cam_x}, cam y: {cam_y}")
+
+        self.get_logger().info(f"Move step: {x_move_step}, {y_move_step}, {z_move_step}")
         if is_in_box and not is_far_from_box:
             self.status = 'DOCKED'
             return
         elif is_in_box and is_far_from_box:
-            self.docking_pose.translation.x += (move_step + 0.1 * (1 - box_ratio)**2)
-        else:  # not in box and far from box
-            if t_x < tol_box[0]:
-                self.docking_pose.translation.y += move_step
-            elif t_x > tol_box[2]:
-                self.docking_pose.translation.y -= move_step
-            if t_y < tol_box[1]:
-                self.docking_pose.translation.z += move_step
-            elif t_y > tol_box[3]:  
-                self.docking_pose.translation.z -= move_step
+            self.docking_pose.translation.x += x_move_step
+        else:
+            self.docking_pose.translation.y -= y_move_step
+            self.docking_pose.translation.z -= z_move_step
         docking_pose = Pose()
         docking_pose.position.x = self.docking_pose.translation.x
         docking_pose.position.y = self.docking_pose.translation.y
@@ -786,28 +852,48 @@ class BoltFastenerNode(Node):
         msg = self.build_armstrong_plan_request(
             group_name='right_arm',
             link_name='r_link6',
+            planning_pipeline='pilz_industrial_motion_planner',
+            planner_id='LIN',
             target_pose=docking_pose,
             wait_after_complete=1.0,
-            vel_scale=0.05,
+            vel_scale=0.03,
         )
+        self.armstrong_plan_status = ARMstrongPlanStatus.PLANNING
         self.armstrong_plan_pub.publish(msg)
 
-    def perform_inserting(self, target_tls: List):
-        assert self.docking_pose is not None
-        target_pose = Pose()
-        target_pose.position.x = self.docking_pose.translation.x + self.insert_translation[0]
-        target_pose.position.y = self.docking_pose.translation.y + self.insert_translation[1]
-        target_pose.position.z = self.docking_pose.translation.z + self.insert_translation[2]
-        target_pose.orientation = self.docking_pose.rotation
+    def get_abstract_depth_from_box(self, area_real, area_px, fx, fy):
+        """Get abstract depth from box"""
+        z = ((fx * fy * area_real) / area_px)
+        return z
+    
+    def get_coord_from_pixel(self, x_px, y_px, z, fx, fy):
+        """Get coordinate from pixel"""
+        x = ((x_px * z) / fx)
+        y = ((y_px * z) / fy)
+        return x, y
+
+    def perform_inserting(self, target_tls: List, target_trigger: int = 512):
         """Perform inserting operation"""
+        assert self.insert_pose is not None
+        self.insert_pose.translation.x += target_tls[0]
+        self.insert_pose.translation.y += target_tls[1]
+        self.insert_pose.translation.z += target_tls[2]
+        target_pose = Pose()
+        target_pose.position.x = self.insert_pose.translation.x
+        target_pose.position.y = self.insert_pose.translation.y
+        target_pose.position.z = self.insert_pose.translation.z
+        target_pose.orientation = self.insert_pose.rotation
         msg = self.build_armstrong_plan_request(
             group_name='right_arm',
             link_name='r_link6',
             target_pose=target_pose,
             wait_after_complete=1.0,
-            vel_scale=0.05,
+            vel_scale=0.02,
+            trigger=target_trigger,
         )
+        self.armstrong_plan_status = ARMstrongPlanStatus.PLANNING
         self.armstrong_plan_pub.publish(msg)
+
 
     def perform_transform(self, source_pose: Tuple[np.ndarray, Rotation], target_transform: Tuple[np.ndarray, Rotation]):
         """Perform transform between source and target poses"""
@@ -843,6 +929,7 @@ class BoltFastenerNode(Node):
             vel_scale=0.2,
         )
         if self.armstrong_plan_status in [ARMstrongPlanStatus.IDLE, ARMstrongPlanStatus.COMPLETED, ARMstrongPlanStatus.FAILED]:
+            self.armstrong_plan_status = ARMstrongPlanStatus.PLANNING
             self.armstrong_plan_pub.publish(msg)
 
     def make_bolt_name(self, box_id, group_id, prefix: Literal['head', 'hand'] = 'head'):
@@ -971,34 +1058,7 @@ class BoltFastenerNode(Node):
 
         return msg
 
-    def on_hand_depth_update(self, msg: CompressedImage):
-        """Process hand camera depth image update"""
-        # Decode depth image
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
-        depth = cv2.imdecode(buf[12:], cv2.IMREAD_UNCHANGED)
-        self.hand_depth = depth.astype(np.float32) / 1000  # Convert to meters
-
-        # Get depth range from trackbars
-        min_depth = cv2.getTrackbarPos('Min Depth', 'hand_depth') / 1000.0  # Convert to meters
-        max_depth = cv2.getTrackbarPos('Max Depth', 'hand_depth') / 1000.0  # Convert to meters
-
-        # Normalize depth for visualization
-        depth_vis = np.clip((depth - min_depth * 1000) / ((max_depth - min_depth) * 1000), 0, 1)
-        depth_vis = (depth_vis * 255).astype(np.uint8)
-        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-
-        # Show depth image
-        cv2.imshow('hand_depth', depth_vis)
-
-    def on_hand_depth_info_update(self, info: CameraInfo):
-        """Update hand camera depth intrinsics"""
-        self.hand_depth_intrinsics = {
-            'fx': info.k[0], 'fy': info.k[4], 
-            'cx': info.k[2], 'cy': info.k[5], 
-            'width': info.width, 'height': info.height, 
-            'mtx': np.array(info.k).reshape(3, 3), 
-            'dist': np.array(info.d)
-        }
+    
 
     @property
     def status(self):
