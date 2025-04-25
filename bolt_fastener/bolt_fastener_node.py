@@ -334,37 +334,62 @@ class BoltFastenerNode(Node):
             ARMstrongPlanStatus.COMPLETED: "COMPLETED",
             ARMstrongPlanStatus.FAILED: "FAILED"
         }
+
+        M32_insert_status = 
         
         self.insert_status = {
             'status': 'IDLE',
-            'status_list': ['IDLE', 'APPROACH', 'INSERT', 'RETRACT', 'COMPLETED'],
-            'APPROACH': (0, 0, 0.09),
-            'INSERT': (0.025, 0, 0),
-            'RETRACT': (-0.1, 0, 0)
+            'status_list': ['IDLE', 'APPROACH', 'INSERT', 'FASTEN', 'RETRACT', 'COMPLETED'],
+            'APPROACH': (0, 0.01, 0.09),
+            'INSERT': (0.04, 0, 0),
+            'FASTEN': (0, 0, 0),
+            'RETRACT': (-0.04, 0, 0)
         }
 
     def on_head_image_update(self, msg: CompressedImage):
         """Process head camera RGB image update"""
-        if self.head_rgb_intrinsics == {}:
-            return
-        contrast = cv2.getTrackbarPos('Contrast', 'head_rgb')
-        brightness = cv2.getTrackbarPos("Brightness", 'head_rgb')
-        self.head_confidence_threshold = cv2.getTrackbarPos("Confidence", 'head_rgb') / 100.0
-        
-        # Decode and process image
-        str_msg = msg.data
-        buf = np.ndarray(shape=(1, len(str_msg)), dtype=np.uint8, buffer=msg.data)
-        image = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        img = image.astype(np.uint8)
-        img = cv2.undistort(img, self.head_rgb_intrinsics['mtx'], self.head_rgb_intrinsics['dist'])
-        # Apply contrast and brightness
-        img = cv2.convertScaleAbs(img, alpha=(contrast-50.0)/50+1, beta=brightness-50)
-        self.head_rgb = img
-        
-        # Update detection
-        res = self.head_detector.track(img)
-        if res is not None:
-            self.head_detection = res
+        try:
+            if self.head_rgb_intrinsics == {}:
+                return
+                
+            # Get trackbar positions with error checking
+            try:
+                contrast = cv2.getTrackbarPos('Contrast', 'head_rgb')
+                brightness = cv2.getTrackbarPos("Brightness", 'head_rgb')
+                self.head_confidence_threshold = cv2.getTrackbarPos("Confidence", 'head_rgb') / 100.0
+            except Exception as e:
+                self.get_logger().warning(f"Failed to read trackbar values: {str(e)}")
+                contrast, brightness = 50, 50
+                self.head_confidence_threshold = 0.5
+            
+            # Decode and process image
+            try:
+                str_msg = msg.data
+                buf = np.ndarray(shape=(1, len(str_msg)), dtype=np.uint8, buffer=msg.data)
+                image = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                
+                if image is None:
+                    self.get_logger().warning("Failed to decode head camera image")
+                    return
+                    
+                img = image.astype(np.uint8)
+                img = cv2.undistort(img, self.head_rgb_intrinsics['mtx'], self.head_rgb_intrinsics['dist'])
+                # Apply contrast and brightness
+                img = cv2.convertScaleAbs(img, alpha=(contrast-50.0)/50+1, beta=brightness-50)
+                self.head_rgb = img
+                
+                # Update detection
+                res = self.head_detector.track(img)
+                if res is not None:
+                    self.head_detection = res
+            except cv2.error as e:
+                self.get_logger().error(f"OpenCV error processing head image: {str(e)}")
+            except ValueError as e:
+                self.get_logger().error(f"Value error processing head image: {str(e)}")
+            except Exception as e:
+                self.get_logger().error(f"Unexpected error processing head image: {str(e)}")
+        except Exception as e:
+            self.get_logger().error(f"Critical error in head image processing: {str(e)}")
 
     def on_hand_image_update(self, msg: CompressedImage):
         """Process hand camera RGB image update"""
@@ -391,66 +416,128 @@ class BoltFastenerNode(Node):
 
     def on_head_depth_update(self, msg: CompressedImage):
         """Process head camera depth image update"""
-        if self.head_depth_intrinsics == {}:
-            return
-        # Decode depth image
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
-        depth = cv2.imdecode(buf[12:], cv2.IMREAD_UNCHANGED)
-        depth = cv2.undistort(depth, self.head_depth_intrinsics['mtx'], self.head_depth_intrinsics['dist'])
-        self.head_depth = depth.astype(np.float32) / 1000
-
-        # Process bolt detection if conditions are met
-        if (self.head_detection is not None 
-            and self.head_depth_intrinsics != {} 
-            and self.head_depth is not None
-            and self.is_head_update_detection):
-            
-            res = self.head_processor.estimate_bolt_pose_pipeline(
-                depth=self.head_depth,
-                detection=self.head_detection,
-                conf=self.head_confidence_threshold,
-                crop_by_roi=True,
-                radius=0.03,
-                force_single_estimation=False)
-            
-            if res is None:
+        try:
+            if self.head_depth_intrinsics == {}:
                 return
                 
-            self.head_bolts, self.head_bolts_detection_info = res
-            
-        # Publish transforms for detected bolts
-        for b in self.head_bolts:
-            self.publish_transform(b, 'head_camera_color_optical_frame')
+            # Decode depth image
+            try:
+                buf = np.frombuffer(msg.data, dtype=np.uint8)
+                depth = cv2.imdecode(buf[12:], cv2.IMREAD_UNCHANGED)
+                
+                if depth is None:
+                    self.get_logger().warning("Failed to decode head depth image")
+                    return
+                    
+                depth = cv2.undistort(depth, self.head_depth_intrinsics['mtx'], self.head_depth_intrinsics['dist'])
+                self.head_depth = depth.astype(np.float32) / 1000  # Convert to meters
+            except IndexError as e:
+                self.get_logger().error(f"Index error decoding depth image: {str(e)}")
+                return
+            except cv2.error as e:
+                self.get_logger().error(f"OpenCV error processing depth image: {str(e)}")
+                return
+            except Exception as e:
+                self.get_logger().error(f"Error processing depth image: {str(e)}")
+                return
+
+            # Process bolt detection if conditions are met
+            if (self.head_detection is not None 
+                and self.head_depth_intrinsics != {} 
+                and self.head_depth is not None
+                and self.is_head_update_detection):
+                
+                try:
+                    res = self.head_processor.estimate_bolt_pose_pipeline(
+                        depth=self.head_depth,
+                        detection=self.head_detection,
+                        conf=self.head_confidence_threshold,
+                        crop_by_roi=True,
+                        radius=0.03,
+                        force_single_estimation=False)
+                    
+                    if res is None:
+                        return
+                        
+                    self.head_bolts, self.head_bolts_detection_info = res
+                except ValueError as e:
+                    self.get_logger().error(f"Value error in bolt pose estimation: {str(e)}")
+                except IndexError as e:
+                    self.get_logger().error(f"Index error in bolt pose estimation: {str(e)}")
+                except Exception as e:
+                    self.get_logger().error(f"Error in bolt pose estimation: {str(e)}")
+                
+            # Publish transforms for detected bolts
+            try:
+                for b in self.head_bolts:
+                    self.publish_transform(b, 'head_camera_color_optical_frame')
+            except Exception as e:
+                self.get_logger().error(f"Error publishing transforms: {str(e)}")
+        except Exception as e:
+            self.get_logger().error(f"Critical error in head depth processing: {str(e)}")
     
     def on_hand_depth_update(self, msg: CompressedImage):
         """Process hand camera depth image update"""
-        if self.hand_depth_intrinsics == {}:
-            return
-        # Decode depth image
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
-        depth = cv2.imdecode(buf[12:], cv2.IMREAD_UNCHANGED)
-        self.hand_depth = depth.astype(np.float32) / 1000  # Convert to meters
+        try:
+            if self.hand_depth_intrinsics == {}:
+                return
+                
+            # Decode depth image
+            try:
+                buf = np.frombuffer(msg.data, dtype=np.uint8)
+                depth = cv2.imdecode(buf[12:], cv2.IMREAD_UNCHANGED)
+                
+                if depth is None:
+                    self.get_logger().warning("Failed to decode hand depth image")
+                    return
+                    
+                self.hand_depth = depth.astype(np.float32) / 1000  # Convert to meters
+            except IndexError as e:
+                self.get_logger().error(f"Index error decoding hand depth image: {str(e)}")
+                return
+            except cv2.error as e:
+                self.get_logger().error(f"OpenCV error processing hand depth image: {str(e)}")
+                return
+            except Exception as e:
+                self.get_logger().error(f"Error processing hand depth image: {str(e)}")
+                return
 
-        # if (self.hand_detection is not None 
-        #     and self.hand_depth_intrinsics != {} 
-        #     and self.hand_depth is not None
-        #     and self.is_hand_update_detection):
+            # Note: The following code is commented out in the original, 
+            # but we're keeping it with error handling for future use
             
-        #     res = self.hand_processor.estimate_bolt_pose_pipeline(
-        #         depth=self.hand_depth,
-        #         detection=self.hand_detection,
-        #         conf=self.hand_confidence_threshold,
-        #         crop_by_roi=True,
-        #         radius=0.015,
-        #         force_single_estimation=True)
+            # if (self.hand_detection is not None 
+            #     and self.hand_depth_intrinsics != {} 
+            #     and self.hand_depth is not None
+            #     and self.is_hand_update_detection):
+            #     
+            #     try:
+            #         res = self.hand_processor.estimate_bolt_pose_pipeline(
+            #             depth=self.hand_depth,
+            #             detection=self.hand_detection,
+            #             conf=self.hand_confidence_threshold,
+            #             crop_by_roi=True,
+            #             radius=0.015,
+            #             force_single_estimation=True)
+            #         
+            #         if res is None:
+            #             return
+            #         
+            #         self.hand_bolts, self.hand_bolts_detection_info = res
+            #     except ValueError as e:
+            #         self.get_logger().error(f"Value error in hand bolt pose estimation: {str(e)}")
+            #     except IndexError as e:
+            #         self.get_logger().error(f"Index error in hand bolt pose estimation: {str(e)}")
+            #     except Exception as e:
+            #         self.get_logger().error(f"Error in hand bolt pose estimation: {str(e)}")
+            # 
+            # try:
+            #     for b in self.hand_bolts:
+            #         self.publish_transform(b, 'hand_camera_color_optical_frame')
+            # except Exception as e:
+            #     self.get_logger().error(f"Error publishing hand transforms: {str(e)}")
             
-        #     if res is None:
-        #         return
-            
-        #     self.hand_bolts, self.hand_bolts_detection_info = res
-        
-        # for b in self.hand_bolts:
-        #     self.publish_transform(b, 'hand_camera_color_optical_frame')
+        except Exception as e:
+            self.get_logger().error(f"Critical error in hand depth processing: {str(e)}")
 
     def on_head_depth_info_update(self, info: CameraInfo):
         """Update head camera depth intrinsics"""
@@ -461,6 +548,7 @@ class BoltFastenerNode(Node):
             'mtx': np.array(info.k).reshape(3, 3), 
             'dist': np.array(info.d)
         }
+        
         self.head_depth_intrinsics = depth_intrinsics
         self.head_processor.set_depth_intrinsics(depth_intrinsics)
         self.head_detector.cam_info = depth_intrinsics
@@ -664,13 +752,21 @@ class BoltFastenerNode(Node):
             self.insert_status['status'] = 'IDLE'
             self.status = 'COMPLETED'
             return
+        
+        wait_after_complete = 0.0
         if self.insert_status['status'] == 'INSERT':
             trigger = 600
+            vel_scale = 0.005
+        elif self.insert_status['status'] == 'FASTEN':
+            trigger = 900
+            vel_scale = 0.001
+            wait_after_complete = 3.0
         else:
             trigger = 512
-        
+            vel_scale = 0.015
+
         self.get_logger().info(f"Inserting status: {self.insert_status['status']}")
-        self.perform_inserting(self.insert_status[self.insert_status['status']], trigger)
+        self.perform_inserting(self.insert_status[self.insert_status['status']], trigger, vel_scale=vel_scale, wait_after_complete=wait_after_complete)
         status_idx = self.insert_status['status_list'].index(self.insert_status['status'])
         self.insert_status['status'] = self.insert_status['status_list'][status_idx + 1]
 
@@ -827,11 +923,10 @@ class BoltFastenerNode(Node):
         is_far_from_box = target_bbox_area < self.projected_bolt_box_area
         box_ratio = np.clip(target_bbox_area / self.projected_bolt_box_area, 0, 1)
         cam_z = self.get_abstract_depth_from_box(self.bolt_size**2, target_bbox_area, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'])
-        cam_x, cam_y = self.get_coord_from_pixel(t_x, t_y, cam_z, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'])
-        center_x, center_y = self.get_coord_from_pixel(self.hand_rgb_intrinsics['width']//2, self.hand_rgb_intrinsics['height']//2, cam_z, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'])
-        x_move_step = cam_z / 2
-        y_move_step = - (cam_y - center_y) / 2
-        z_move_step = - (cam_x - center_x) / 2
+        cam_x, cam_y, cam_z = self.pixel_to_camera_coords(t_x, t_y, cam_z, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'], self.hand_rgb_intrinsics['cx'], self.hand_rgb_intrinsics['cy']) 
+        x_move_step = (cam_z - self.target_z)
+        y_move_step = cam_x
+        z_move_step = cam_y
         self.get_logger().info(f"Cam z: {cam_z}, cam x: {cam_x}, cam y: {cam_y}")
 
         self.get_logger().info(f"Move step: {x_move_step}, {y_move_step}, {z_move_step}")
@@ -863,7 +958,7 @@ class BoltFastenerNode(Node):
 
     def get_abstract_depth_from_box(self, area_real, area_px, fx, fy):
         """Get abstract depth from box"""
-        z = ((fx * fy * area_real) / area_px)
+        z = ((fx * fy * area_real) / area_px) ** (1/2)
         return z
     
     def get_coord_from_pixel(self, x_px, y_px, z, fx, fy):
@@ -872,7 +967,12 @@ class BoltFastenerNode(Node):
         y = ((y_px * z) / fy)
         return x, y
 
-    def perform_inserting(self, target_tls: List, target_trigger: int = 512):
+    def pixel_to_camera_coords(self, u, v, Z, fx, fy, cx, cy):
+        X = (u - cx) * Z / fx
+        Y = (v - cy) * Z / fy
+        return np.array([X, Y, Z])
+
+    def perform_inserting(self, target_tls: List, target_trigger: int = 512, vel_scale: float = 0.005, wait_after_complete: float = 0.5):
         """Perform inserting operation"""
         assert self.insert_pose is not None
         self.insert_pose.translation.x += target_tls[0]
@@ -887,8 +987,8 @@ class BoltFastenerNode(Node):
             group_name='right_arm',
             link_name='r_link6',
             target_pose=target_pose,
-            wait_after_complete=1.0,
-            vel_scale=0.02,
+            wait_after_complete=wait_after_complete,
+            vel_scale=vel_scale,
             trigger=target_trigger,
         )
         self.armstrong_plan_status = ARMstrongPlanStatus.PLANNING
