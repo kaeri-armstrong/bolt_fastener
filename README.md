@@ -97,24 +97,6 @@ The system consists of several key components:
 3. **PointCloudProcessor**: Processes 3D point cloud data
 4. **InsertStatus**: Manages insertion process states
 
-## GUI Controls
-- 'q': Quit
-- 'f': Toggle detection update
-- Left click: Select bolt target
-- Trackbars: Adjust depth visualization and detection parameters
-
 ## Troubleshooting
 Common issues and solutions:
 1. 카메라가 안켜져요: `use_tcp_tunnel` 사용 해보기 (ex. `ros2 run tcp_tunnel client --ros-args -p client_ip:=[your_pc_ip] -p initial_topic_list_file_name:='~/ros2ws/src/ros2_tcp_tunnel/topic_list.yaml'`)
- 
-## Contributing
-
-[Add contribution guidelines here]
-
-## License
-
-[Add license information here]
-
-## Contact
-
-[Add contact information here] 
