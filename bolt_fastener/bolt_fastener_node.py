@@ -1,10 +1,9 @@
-from typing import Tuple, Optional, Literal, List, Callable
+from typing import Tuple, Optional, Literal, List, Callable, Union
 import subprocess
 
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
-from scipy.linalg import pinv
 
 import rclpy
 from rclpy.node import Node
@@ -19,11 +18,11 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformListener, StaticTrans
 
 
 from sensor_msgs.msg import CameraInfo, CompressedImage, JointState, Imu
-from geometry_msgs.msg import TransformStamped, Pose, Transform, Twist
+from geometry_msgs.msg import TransformStamped, Pose, Transform
 
 from ass_msgs.msg import ARMstrongKinematics, ARMstrongPlanRequest, ARMstrongPlanStatus, DXLCommand
 
-from armstrong_py.conversions import ros_pos_to_np_pos, ros_quat_to_rotation, list_to_ros_vec3, list_to_ros_point, rot_to_ros_quat
+from armstrong_py.conversions import ros_pos_to_np_pos, ros_quat_to_rotation, list_to_ros_vec3, list_to_ros_point, rot_to_ros_quat, transform_to_pose, pose_to_transform
 
 from bolt_fastener.bolt_detector import BoltDetector, DetectionResult
 from bolt_fastener.point_cloud_processor import PointCloudProcessor
@@ -88,7 +87,7 @@ class BoltFastenerNode(Node):
         self.target = None
         self.target_pose = None
         self._status: Literal['IDLE', 'ALIGNING', 'ALIGNED', 'TUNED', 'DOCKING', 'DOCKED', 'INSERTING', 'INSERTED', 'FAILED'] = 'IDLE'
-        self.docking_pose = None
+        self.docking_pose: Pose | None = None
         self.insert_translation = [0.0, 0.0, 0.0]  # Initialize insert translation vector
         self.tolerance = 25  # px
 
@@ -150,7 +149,7 @@ class BoltFastenerNode(Node):
         hand_cam_transform.header.stamp = self.get_clock().now().to_msg()
         hand_cam_transform.header.frame_id = 'r_link6'
         hand_cam_transform.child_frame_id = 'hand_camera_link'
-        hand_cam_transform.transform.translation = list_to_ros_vec3(np.array([164.36, -20.5, 58.]) / 1000)
+        hand_cam_transform.transform.translation = list_to_ros_vec3(np.array([228.01, -35.5, 46.]) / 1000)
         hand_cam_transform.transform.rotation = rot_to_ros_quat(Rotation.identity())
 
         tf_static_broadcaster.sendTransform(head_cam_transform)
@@ -341,10 +340,10 @@ class BoltFastenerNode(Node):
         }
 
         M32_insert_status = InsertStatus(
-            approach=(0, 0.01, 0.09),
-            insert=(0.04, 0, 0),
+            approach=(0, 0.01, 0.07),
+            insert=(0.03, 0, 0),
             fasten=(0, 0, 0),
-            retract=(-0.04, 0, 0)
+            retract=(-0.03, 0, 0)
         )
 
         self.insert_status = M32_insert_status
@@ -621,7 +620,7 @@ class BoltFastenerNode(Node):
                             if self.head_bolts_detection_info.group_id is not None 
                             else None
                     )
-                    self.target_pose = self.get_target_pose(target, tgt_offset=[-0.40, 0, -0.075])
+                    self.target_pose = self.get_target_pose(target, tgt_offset=[-0.50, 0, -0.05])
                     if self.target_pose is not None:
                         self.follow_target(self.target_pose)
                     return
@@ -641,9 +640,9 @@ class BoltFastenerNode(Node):
 
     def on_head_draw_timer(self):
         """Update head camera visualization"""
-        rgb = self.head_rgb
-        if rgb is None:
+        if self.head_rgb is None:
             return
+        rgb = self.head_rgb.copy()
             
         # Update FPS calculation
         current_time = self.get_clock().now()
@@ -672,9 +671,9 @@ class BoltFastenerNode(Node):
 
     def on_hand_draw_timer(self):
         """Update hand camera visualization"""
-        rgb = self.hand_rgb
-        if rgb is None or len(self.hand_rgb_intrinsics.keys()) == 0:
+        if self.hand_rgb is None or len(self.hand_rgb_intrinsics.keys()) == 0:
             return
+        rgb = self.hand_rgb.copy()
 
         # Update FPS calculation
         current_time = self.get_clock().now()
@@ -774,7 +773,7 @@ class BoltFastenerNode(Node):
         """Setup projected bolt box for hand camera"""
         if self.projected_bolt_box_area is None:
             self.bolt_size = 0.036
-            self.target_z = 0.22
+            self.target_z = 0.145
 
             self.bolt_box = np.array([
                 [-self.bolt_size/2, -self.bolt_size/2, self.target_z],
@@ -881,23 +880,23 @@ class BoltFastenerNode(Node):
                 self.status = 'DOCKED'
                 return
             else:
-                self.docking_pose.translation.x += 0.01
+                self.docking_pose.position.x += 0.01
         else:
             if t_x < box[0]:
-                self.docking_pose.translation.y += 0.01
+                self.docking_pose.position.y += 0.01
             elif t_x > box[2]:
-                self.docking_pose.translation.y -= 0.01
+                self.docking_pose.position.y -= 0.01
             if t_y < box[1]:
-                self.docking_pose.translation.z += 0.01
+                self.docking_pose.position.z += 0.01
             elif t_y > box[3]:
-                self.docking_pose.translation.z -= 0.01 
+                self.docking_pose.position.z -= 0.01
 
-        self.get_logger().info(f"Docking pose: {self.docking_pose.translation.x}, {self.docking_pose.translation.y}, {self.docking_pose.translation.z}")
+        self.get_logger().info(f"Docking pose: {self.docking_pose.position.x}, {self.docking_pose.position.y}, {self.docking_pose.position.z}")
         docking_pose = Pose()
-        docking_pose.position.x = self.docking_pose.translation.x
-        docking_pose.position.y = self.docking_pose.translation.y
-        docking_pose.position.z = self.docking_pose.translation.z
-        docking_pose.orientation = self.docking_pose.rotation
+        docking_pose.position.x = self.docking_pose.position.x
+        docking_pose.position.y = self.docking_pose.position.y
+        docking_pose.position.z = self.docking_pose.position.z
+        docking_pose.orientation = self.docking_pose.orientation
         
         self.get_logger().info(f"Target point: {t_x}, {t_y}")
         self.get_logger().info(f"Center Pixel: {center_px[0]}, {center_px[1]}")
@@ -925,31 +924,30 @@ class BoltFastenerNode(Node):
         cam_z = self.get_abstract_depth_from_box(self.bolt_size**2, target_bbox_area, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'])
         cam_x, cam_y, cam_z = self.pixel_to_camera_coords(t_x, t_y, cam_z, self.hand_rgb_intrinsics['fx'], self.hand_rgb_intrinsics['fy'], self.hand_rgb_intrinsics['cx'], self.hand_rgb_intrinsics['cy']) 
         x_move_step = (cam_z - self.target_z)
-        y_move_step = cam_x
-        z_move_step = cam_y
+        y_move_step = -cam_x
+        z_move_step = -cam_y
+        
         self.get_logger().info(f"Cam z: {cam_z}, cam x: {cam_x}, cam y: {cam_y}")
+
+        tgt_tf = np.zeros(3)
 
         self.get_logger().info(f"Move step: {x_move_step}, {y_move_step}, {z_move_step}")
         if is_in_box and not is_far_from_box:
             self.status = 'DOCKED'
             return
         elif is_in_box and is_far_from_box:
-            self.docking_pose.translation.x += x_move_step
+            tgt_tf[0] = x_move_step
         else:
-            self.docking_pose.translation.y -= y_move_step
-            self.docking_pose.translation.z -= z_move_step
-        docking_pose = Pose()
-        docking_pose.position.x = self.docking_pose.translation.x
-        docking_pose.position.y = self.docking_pose.translation.y
-        docking_pose.position.z = self.docking_pose.translation.z
-        docking_pose.orientation = self.docking_pose.rotation
-        
+            tgt_tf[1] = y_move_step
+            tgt_tf[2] = z_move_step
+        self.docking_pose = self.apply_rotation_to_transform(self.docking_pose, tgt_tf)
+
         msg = self.build_armstrong_plan_request(
             group_name='right_arm',
             link_name='r_link6',
             planning_pipeline='pilz_industrial_motion_planner',
             planner_id='LIN',
-            target_pose=docking_pose,
+            target_pose=self.docking_pose,
             wait_after_complete=1.0,
             vel_scale=0.03,
         )
@@ -961,32 +959,34 @@ class BoltFastenerNode(Node):
         z = ((fx * fy * area_real) / area_px) ** (1/2)
         return z
     
-    def get_coord_from_pixel(self, x_px, y_px, z, fx, fy):
-        """Get coordinate from pixel"""
-        x = ((x_px * z) / fx)
-        y = ((y_px * z) / fy)
-        return x, y
-
     def pixel_to_camera_coords(self, u, v, Z, fx, fy, cx, cy):
         X = (u - cx) * Z / fx
         Y = (v - cy) * Z / fy
         return np.array([X, Y, Z])
+    
+    def apply_rotation_to_transform(self, source_pose: Pose | Transform, target_tls: np.ndarray) -> Pose:
+        """Apply rotation to transform"""
+        if isinstance(source_pose, Transform):
+            source_pos = ros_pos_to_np_pos(source_pose.translation)
+            source_rot = ros_quat_to_rotation(source_pose.rotation)
+        else:
+            source_pos = ros_pos_to_np_pos(source_pose.position)
+            source_rot = ros_quat_to_rotation(source_pose.orientation)
+        target_tls = source_rot.apply(target_tls) + source_pos
+        target_rot = source_rot
+        ret_pose = Pose()
+        ret_pose.position = list_to_ros_point(target_tls)
+        ret_pose.orientation = rot_to_ros_quat(target_rot)
+        return ret_pose
 
     def perform_inserting(self, target_tls: List, target_trigger: int = 512, vel_scale: float = 0.005, wait_after_complete: float = 0.5):
         """Perform inserting operation"""
         assert self.insert_pose is not None
-        self.insert_pose.translation.x += target_tls[0]
-        self.insert_pose.translation.y += target_tls[1]
-        self.insert_pose.translation.z += target_tls[2]
-        target_pose = Pose()
-        target_pose.position.x = self.insert_pose.translation.x
-        target_pose.position.y = self.insert_pose.translation.y
-        target_pose.position.z = self.insert_pose.translation.z
-        target_pose.orientation = self.insert_pose.rotation
+        self.insert_pose = self.apply_rotation_to_transform(self.insert_pose, target_tls)
         msg = self.build_armstrong_plan_request(
             group_name='right_arm',
             link_name='r_link6',
-            target_pose=target_pose,
+            target_pose=self.insert_pose,
             wait_after_complete=wait_after_complete,
             vel_scale=vel_scale,
             trigger=target_trigger,
@@ -1042,8 +1042,8 @@ class BoltFastenerNode(Node):
         if tf is None:
             return
         
-        pos = ros_pos_to_np_pos(tf.translation)
-        rot = ros_quat_to_rotation(tf.rotation)
+        pos = ros_pos_to_np_pos(tf.position)
+        rot = ros_quat_to_rotation(tf.orientation)
         rot *= Rotation.from_rotvec([0, -90, 0], True)
         rot *= Rotation.from_rotvec([-90, 0, 0], True)
 
@@ -1070,14 +1070,14 @@ class BoltFastenerNode(Node):
         target_pose.orientation = rot_to_ros_quat(rot)
         return target_pose
 
-    def get_transform(self, origin, target) -> Transform | None:
+    def get_transform(self, origin, target) -> Pose | None:
         """Get transform between origin and target"""
         now = self.get_clock().now()
         if not self.tf_buffer.can_transform(origin, target, Time()):
             return
         
         ts = self.tf_buffer.lookup_transform(origin, target, Time())
-        return ts.transform
+        return transform_to_pose(ts.transform)
 
     def toggle_fix_pose(self):
         """Toggle fix pose mode"""
