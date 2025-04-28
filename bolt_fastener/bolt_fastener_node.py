@@ -4,6 +4,7 @@ import subprocess
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
+from scipy.linalg import pinv
 
 import rclpy
 from rclpy.node import Node
@@ -18,7 +19,7 @@ from tf2_ros import Buffer, TransformBroadcaster, TransformListener, StaticTrans
 
 
 from sensor_msgs.msg import CameraInfo, CompressedImage, JointState, Imu
-from geometry_msgs.msg import TransformStamped, Pose, Transform
+from geometry_msgs.msg import TransformStamped, Pose, Transform, Twist
 
 from ass_msgs.msg import ARMstrongKinematics, ARMstrongPlanRequest, ARMstrongPlanStatus, DXLCommand
 
@@ -26,7 +27,8 @@ from armstrong_py.conversions import ros_pos_to_np_pos, ros_quat_to_rotation, li
 
 from bolt_fastener.bolt_detector import BoltDetector, DetectionResult
 from bolt_fastener.point_cloud_processor import PointCloudProcessor
-
+from bolt_fastener.insert_status import InsertStatus
+        
 
 class BoltFastenerNode(Node):
     def __init__(self, name='bolt_fastener', use_tcp_tunnel=True):
@@ -61,6 +63,9 @@ class BoltFastenerNode(Node):
         
         # Setup status maps
         self._setup_status_maps()
+        
+        # Initialize visual servoing controller
+        self.visual_servo = None
 
     def _initialize_detectors(self):
         """Initialize bolt detectors and point cloud processors"""
@@ -335,17 +340,15 @@ class BoltFastenerNode(Node):
             ARMstrongPlanStatus.FAILED: "FAILED"
         }
 
-        M32_insert_status = 
-        
-        self.insert_status = {
-            'status': 'IDLE',
-            'status_list': ['IDLE', 'APPROACH', 'INSERT', 'FASTEN', 'RETRACT', 'COMPLETED'],
-            'APPROACH': (0, 0.01, 0.09),
-            'INSERT': (0.04, 0, 0),
-            'FASTEN': (0, 0, 0),
-            'RETRACT': (-0.04, 0, 0)
-        }
+        M32_insert_status = InsertStatus(
+            approach=(0, 0.01, 0.09),
+            insert=(0.04, 0, 0),
+            fasten=(0, 0, 0),
+            retract=(-0.04, 0, 0)
+        )
 
+        self.insert_status = M32_insert_status
+        
     def on_head_image_update(self, msg: CompressedImage):
         """Process head camera RGB image update"""
         try:
@@ -600,7 +603,7 @@ class BoltFastenerNode(Node):
             self.status = 'ALIGNED'
         elif self.armstrong_plan_status == ARMstrongPlanStatus.FAILED:
             if self.status == 'INSERTING':
-                self.insert_status['status'] = 'IDLE'
+                self.insert_status.status = 'IDLE'
             self.status = 'FAILED'
 
     def on_head_mouse_event(self, event: int, x: int, y: int, flags: int, params=None) -> None:
@@ -712,7 +715,7 @@ class BoltFastenerNode(Node):
         elif self.status == 'INSERTING':
             self._handle_inserting_control() 
         elif self.status == 'FAILED':
-            self.insert_status['status'] = 'IDLE'
+            self.insert_status.status = 'IDLE'
 
     def _handle_docking_control(self):
         """Handle docking control logic"""
@@ -732,9 +735,7 @@ class BoltFastenerNode(Node):
                 target_bbox = self.hand_detection.xyxy[target_idx]
                 target_bbox_area = np.multiply(*(target_bbox[0:2] - target_bbox[2:]))
 
-                # Adjust tolerance based on target box area
-                box_ratio = target_bbox_area / self.projected_bolt_box_area
-                self.tolerance = 25
+                # Update visual servoing target
                 center_px = (self.hand_rgb_intrinsics['width'] // 2, self.hand_rgb_intrinsics['height'] // 2)
                 box = np.array([center_px[0] - self.tolerance, center_px[1] - self.tolerance, 
                               center_px[0] + self.tolerance, center_px[1] + self.tolerance]).astype(np.int32)
@@ -746,18 +747,18 @@ class BoltFastenerNode(Node):
         if self.armstrong_plan_status not in [ARMstrongPlanStatus.IDLE, ARMstrongPlanStatus.COMPLETED, ARMstrongPlanStatus.FAILED]:
             return
 
-        if self.insert_status['status'] == 'IDLE':
-            self.insert_status['status'] = 'APPROACH'
-        elif self.insert_status['status'] == 'COMPLETED':
-            self.insert_status['status'] = 'IDLE'
+        if self.insert_status.is_idle():
+            self.insert_status.status = 'APPROACH'
+        elif self.insert_status.is_completed():
+            self.insert_status.status = 'IDLE'
             self.status = 'COMPLETED'
             return
         
         wait_after_complete = 0.0
-        if self.insert_status['status'] == 'INSERT':
+        if self.insert_status.status == 'INSERT':
             trigger = 600
             vel_scale = 0.005
-        elif self.insert_status['status'] == 'FASTEN':
+        elif self.insert_status.status == 'FASTEN':
             trigger = 900
             vel_scale = 0.001
             wait_after_complete = 3.0
@@ -765,10 +766,9 @@ class BoltFastenerNode(Node):
             trigger = 512
             vel_scale = 0.015
 
-        self.get_logger().info(f"Inserting status: {self.insert_status['status']}")
-        self.perform_inserting(self.insert_status[self.insert_status['status']], trigger, vel_scale=vel_scale, wait_after_complete=wait_after_complete)
-        status_idx = self.insert_status['status_list'].index(self.insert_status['status'])
-        self.insert_status['status'] = self.insert_status['status_list'][status_idx + 1]
+        self.get_logger().info(f"Inserting status: {self.insert_status.status}")
+        self.perform_inserting(self.insert_status.get_current_params(), trigger, vel_scale=vel_scale, wait_after_complete=wait_after_complete)
+        self.insert_status.status = self.insert_status.get_next_status()
 
     def _setup_projected_bolt_box(self):
         """Setup projected bolt box for hand camera"""

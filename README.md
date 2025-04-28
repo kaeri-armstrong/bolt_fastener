@@ -1,62 +1,101 @@
-# Bolt Fastener ROS2 Package
+# Bolt Fastener
 
-A ROS2-based system for automated bolt detection and manipulation using computer vision and robotic control.
+A ROS2-based robotic system for automated bolt detection and fastening using computer vision and robotic control.
+
+## Overview
+
+This project implements an automated bolt fastening system that uses computer vision to detect bolts and a robotic arm to perform the fastening operation. The system utilizes two cameras (head and hand cameras) for visual feedback and precise positioning.
 
 ## Features
-- Real-time bolt detection using YOLO
-- 3D pose estimation using depth camera
-- Interactive GUI with depth and RGB visualization
-- Robot arm control integration
-- Bolt tracking and grouping
-- Performance monitoring
 
-## Requirements
-- ROS2 (tested on Humble)
-- Python 3.10
+- **Bolt Detection**: Real-time bolt detection using computer vision
+- **3D Pose Estimation**: Accurate 3D position and orientation estimation of detected bolts
+- **Robotic Control**: Integration with ARMstrong robot arm for precise motion control
+- **Multi-stage Process**:
+  - Detection and alignment
+  - Docking (positioning)
+  - Insertion (fastening)
+- **Real-time Visualization**: OpenCV-based visualization of:
+  - Camera feeds
+  - Detection results
+  - Status information
+  - Performance metrics
+
+## System Requirements
+
+- ROS2 (tested with [version])
+- Python 3.x
 - OpenCV
 - NumPy
-- SciPy
-- Ultralytics (YOLO)
-- ARMstrong robot control system
+- ARMstrong robot arm
+- RGB-D cameras (head and hand cameras)
 
 ## Installation
-1. Clone this repository into your ROS2 workspace:
-```zsh
-cd ~/ros2ws/src
-git clone [repository_url]
+
+1. Clone the repository:
+```bash
+git clone [repository-url]
+cd bolt_fastener
 ```
 
 2. Install dependencies:
-```zsh
-cd ~/ros2ws
-rosdep install --from-paths src --ignore-src -r -y
+```bash
+pip install -r requirements.txt
 ```
 
-3. Build the package:
-```zsh
-colcon build --symlink-install --packages-select bolt_fastener
+3. Build the ROS2 workspace:
+```bash
+colcon build
+source install/setup.bash
 ```
 
 ## Usage
-1. Source your workspace:
-```zsh
-source ~/ros2ws/install/setup.zsh
-```
-2. Launch camera node: on ARMstrong pc,
-```zsh
-ros2 launch backass cam_rs.launch.py
-```
 
-2. Launch the node:
-```zsh
+1. Start the bolt fastener node:
+```bash
 ros2 run bolt_fastener bolt_fastener_node
 ```
 
-## Configuration
-The system can be configured through ROS2 parameters:
-- `confidence_threshold`: Detection confidence threshold (default: 0.5)
-- `use_tcp_tunnel`: Use TCP tunnel for camera communication (default: true)
-- `camera_namespace`: Camera topic namespace (default: '/camera/camera')
+2. The system will:
+   - Initialize cameras and visualizations
+   - Begin bolt detection
+   - Allow manual target selection via mouse click
+   - Automatically perform alignment and fastening
+
+### Control Interface
+
+- **Mouse Controls**:
+  - Left click on detected bolts to select target
+  - Right click to deselect target
+
+- **Keyboard Controls**:
+  - `q`: Quit application
+  - `f`: Toggle fix pose mode
+  - `r`: Reset planning status
+  - `a`: Set offset by IMU
+  - `i`: Start insertion process
+
+## System States
+
+The system operates in the following states:
+- `IDLE`: Initial state
+- `ALIGNING`: Aligning with detected bolt
+- `ALIGNED`: Successfully aligned
+- `TUNED`: Fine-tuned position
+- `DOCKING`: Moving to bolt position
+- `DOCKED`: Successfully positioned
+- `INSERTING`: Performing bolt insertion
+- `INSERTED`: Successfully inserted
+- `FAILED`: Error state
+
+## Architecture
+
+The system consists of several key components:
+
+1. **BoltFastenerNode**: Main ROS2 node orchestrating the process
+2. **BoltDetector**: Handles bolt detection in camera images
+3. **PointCloudProcessor**: Processes 3D point cloud data
+4. **InsertStatus**: Manages insertion process states
 
 ## GUI Controls
 - 'q': Quit
@@ -69,7 +108,13 @@ Common issues and solutions:
 1. 카메라가 안켜져요: `use_tcp_tunnel` 사용 해보기 (ex. `ros2 run tcp_tunnel client --ros-args -p client_ip:=[your_pc_ip] -p initial_topic_list_file_name:='~/ros2ws/src/ros2_tcp_tunnel/topic_list.yaml'`)
  
 ## Contributing
-Please read CONTRIBUTING.md for details on our code of conduct and the process for submitting pull requests.
+
+[Add contribution guidelines here]
 
 ## License
-This project is licensed under the MIT License - see the LICENSE file for details. 
+
+[Add license information here]
+
+## Contact
+
+[Add contact information here] 
